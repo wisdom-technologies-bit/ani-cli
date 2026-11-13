@@ -559,7 +559,10 @@ Ani-skip uses the external lua script function of mpv and as such â€“ for now â€
 ## FAQ
 <details>
 	
-* Can I change subtitle language or turn them off? - Subtitles are a separate english track handed to the player, so you can toggle them there (mpv: press `v`). Other languages are not offered.
+* Can I change subtitle language or turn them off? - Every subtitle track the provider lists for an episode is fetched and handed to the player, one file per track, named after the provider's own label (`English`, `English (Crunchyroll)`, `Spanish`, ...). Open the player's subtitle menu to switch tracks or turn them off mid-episode (mpv: press `j` for the track list, or `j` then the track number; `v` toggles subtitles on and off). Nothing is transcribed or detected from the audio: the label is what the provider supplied, and a track whose label names no language is shown as the provider wrote it.
+* Which subtitle does it start with? - The provider's default track when it marks one, otherwise the one matching `-L/--sub-lang` (`ani-cli -L spanish one piece`), otherwise subtitles start off. A track is never picked just because it was listed first.
+* Where are subtitle files kept? - In `${TMPDIR:-/tmp}/ani-cli-subs/<title>-ep<number>/` (set `ANI_CLI_SUB_DIR` to change it), or next to the video when downloading with `-d`.
+* What if a subtitle track fails? - That track is skipped with a warning and the rest of the tracks and the video still play.
 * Can I watch dub? - Yes, use `--dub`.
 * Can I change dub language? - No.
 * Can I change media source? - No (unless you can scrape that source yourself).

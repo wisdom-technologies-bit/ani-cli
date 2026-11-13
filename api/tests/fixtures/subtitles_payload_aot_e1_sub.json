@@ -1,0 +1,32 @@
+[
+ {
+  "lang": "en",
+  "label": "English",
+  "default": true,
+  "src": "https://hls.dramahot.top/v/scxqicy/me0srwfivs/ibe6onw2kd/sr5zlp1810dncn/subs/imub5ydz707owhyd.vtt"
+ },
+ {
+  "lang": "en",
+  "label": "English 2",
+  "default": false,
+  "src": "https://hls.dramahot.top/v/scxqicy/me0srwfivs/ibe6onw2kd/sr5zlp1810dncn/subs/uczxwi1ija5zfsfq.vtt"
+ },
+ {
+  "lang": "en",
+  "label": "English (- (Crunchyroll))",
+  "default": false,
+  "src": "https://hls.dramahot.top/v/scxqicy/me0srwfivs/ibe6onw2kd/sr5zlp1810dncn/subs/izg3tn8m2jr5k5hn.vtt"
+ },
+ {
+  "lang": "en",
+  "label": "Portuguese",
+  "default": false,
+  "src": "https://hls.dramahot.top/v/scxqicy/me0srwfivs/ibe6onw2kd/sr5zlp1810dncn/subs/khl2ipqxo0p2lmn2.vtt"
+ },
+ {
+  "lang": "en",
+  "label": "Spanish",
+  "default": false,
+  "src": "https://hls.dramahot.top/v/scxqicy/me0srwfivs/ibe6onw2kd/sr5zlp1810dncn/subs/1eknqowheit6hfxf.vtt"
+ }
+]

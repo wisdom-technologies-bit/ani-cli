@@ -33,6 +33,7 @@ from ..models import (AudioInfo, DownloadInfo, MalContext, MalPart, StreamRespon
 from ..singleflight import SingleFlight
 from .mal import parse_embed_mal
 from .security import sign_payload
+from .subtitles import detect_unknown_formats, enrich_tracks
 
 # Measured 2026-11-12 by repeated real requests: a URL was still serving at ~28
 # minutes. Evidence, not a guarantee, and labelled as such in responses.
@@ -83,6 +84,17 @@ class StreamService:
         return {"reachable": r.status_code < 400, "http_code": r.status_code,
                 "bytes": len(r.content), "content_type": r.headers.get("content-type"),
                 "edge_cache_status": cf, "age": age, "cached_403": cached_403}
+
+    async def _subtitle_text(self, url: str, referer: str) -> str | None:
+        """Best-effort subtitle fetch used only to learn a track's format."""
+        try:
+            response = await self._http.client.get(url, headers={"Referer": referer},
+                                                  timeout=5)
+        except Exception:                                # network, TLS, timeout
+            return None
+        if response.status_code >= 400:
+            return None
+        return response.text
 
     async def _media_first_segment(self, playlist_url: str, referer: str) -> str | None:
         try:
@@ -275,11 +287,19 @@ class StreamService:
                            stage="segment", provider=server.name, retryable=True, retry_after=120,
                            detail="; ".join(f"{v.quality}: {v.blocked_reason}" for v in probed))
 
-        subs = []
-        for track in streams.subtitles:
+        # Every track the provider offered, with the provider's own label kept and a
+        # unique display title per track. Nothing is filtered by language and no
+        # track is dropped for being the second (or tenth) of its language.
+        subs = enrich_tracks(streams.subtitles)
+        if any(track.format == "unknown" for track in subs):
+            # Only tracks whose URL states no format are sniffed, and only the first
+            # few: an unknown extension must not be reported as playable without proof.
+            await detect_unknown_formats(
+                subs, lambda url: self._subtitle_text(url, streams.referer))
+        for track in subs:
             track.proxied_url = "/v1/subtitles/" + sign_payload(
                 {"u": track.url, "r": streams.referer, "k": "sub"}) + ".vtt"
-            subs.append(track)
+        default_track = next((track for track in subs if track.default), None)
 
         payload = StreamResponse(
             request_id=request_id,
@@ -299,6 +319,8 @@ class StreamService:
             variants=probed,
             alternatives=[v for v in probed if v is not chosen and v.playable],
             subtitles=subs,
+            subtitle_count=len(subs),
+            subtitle_default_id=default_track.id if default_track else None,
             audio_tracks=[{"source": "muxed", "separate_audio_track_url": streams.audio_track_url}],
             headers_required={
                 "master_playlist": {"Referer": streams.referer},

@@ -65,6 +65,9 @@ help_info() {
         Select nth entry
       -q, --quality
         Specify the video quality
+      -L, --sub-lang
+        Preselect the subtitle track for this language (e.g. en, japanese); every
+        track the provider lists is still available in the player's subtitle menu
       -v, --vlc
         Use VLC to play the video
       -V, --version
@@ -220,7 +223,8 @@ hianime_episodes() {
         sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${1}[?]ep=.*|\\2\\t\\1|p"
 }
 
-# resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
+# resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_tracks,
+# sub_link (the provider's default track), mal_id and refr
 hianime_m3u8() {
     _ep_id=$(printf "%s" "$episode_maps" | sed -nE "s|^([0-9]+)\t${1}$|\1|p")
     #shellcheck disable=SC2059
@@ -237,7 +241,13 @@ hianime_m3u8() {
     _json="$(deobfuscate_blob "$_blob")"
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
-    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | grep -m 1 '"default":true' | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
+    # every subtitle track the embed lists, deduplicated and named; the provider's
+    # default track (when it marks one) is what sub_link points at
+    sub_tracks="$(printf "%s" "$_json" | subtitle_tracks | subtitle_unique)"
+    sub_ready=""
+    _tab="$(printf '\t')"
+    sub_link="$(printf "%s\n" "$sub_tracks" | sed -n "s|^[^${_tab}]*${_tab}[^${_tab}]*${_tab}1${_tab}||p" | head -n 1)"
+    [ -z "$sub_link" ] && sub_link="$(printf "%s\n" "$sub_tracks" | cut -f 4 | grep -v '^$' | head -n 1)"
     _playlist="$(hianime_curl "$_m3u8_master" -e "$refr")"
     # quality variants are relative to the master playlist
     links="$(printf "%s\n" "$_playlist" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
@@ -343,6 +353,260 @@ update_history() {
     mv "${histfile}.new" "$histfile"
 }
 
+
+# SUBTITLES
+#
+# The embed lists every subtitle track the provider has; all of them are kept. The
+# provider's "lang" field is "en" on every track it sends (including tracks labelled
+# Thai or Arabic), so the label is what identifies a language here. Nothing is
+# transcribed, detected from the audio, or sent to another service.
+
+# canonical English name for a lowercased language word, empty when unknown
+subtitle_language_name() {
+    case "$1" in
+        english) printf "English" ;;
+        japanese) printf "Japanese" ;;
+        spanish | espanol | "español") printf "Spanish" ;;
+        portuguese) printf "Portuguese" ;;
+        french) printf "French" ;;
+        german) printf "German" ;;
+        italian) printf "Italian" ;;
+        russian) printf "Russian" ;;
+        arabic) printf "Arabic" ;;
+        thai) printf "Thai" ;;
+        indonesian) printf "Indonesian" ;;
+        chinese | mandarin) printf "Chinese" ;;
+        cantonese) printf "Cantonese" ;;
+        korean) printf "Korean" ;;
+        vietnamese) printf "Vietnamese" ;;
+        malay) printf "Malay" ;;
+        turkish) printf "Turkish" ;;
+        polish) printf "Polish" ;;
+        dutch) printf "Dutch" ;;
+        hebrew) printf "Hebrew" ;;
+        greek) printf "Greek" ;;
+        bulgarian) printf "Bulgarian" ;;
+        danish) printf "Danish" ;;
+        finnish) printf "Finnish" ;;
+        norwegian) printf "Norwegian" ;;
+        swedish) printf "Swedish" ;;
+        czech) printf "Czech" ;;
+        hungarian) printf "Hungarian" ;;
+        romanian) printf "Romanian" ;;
+        ukrainian) printf "Ukrainian" ;;
+        hindi) printf "Hindi" ;;
+        bengali) printf "Bengali" ;;
+        tamil) printf "Tamil" ;;
+        telugu) printf "Telugu" ;;
+        filipino) printf "Filipino" ;;
+        tagalog) printf "Tagalog" ;;
+        persian | farsi) printf "Persian" ;;
+        urdu) printf "Urdu" ;;
+        croatian) printf "Croatian" ;;
+        serbian) printf "Serbian" ;;
+        *) printf "" ;;
+    esac
+}
+
+# strip brackets, dashes and spaces wrapped around a descriptor
+subtitle_strip_wrapping() {
+    printf "%s" "$1" |
+        sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' |
+        sed -E 's/^[][(){}[:space:]:_,.|-]+//; s/[][(){}[:space:]:_,.|-]+$//'
+}
+
+# first word of a string, lowercased
+subtitle_head_word() {
+    printf "%s" "$1" | sed -nE 's/^[[:space:]]*([^][(){}[:space:]]+).*/\1/p' | tr '[:upper:]' '[:lower:]'
+}
+
+# drop the first word of a string
+subtitle_tail() {
+    printf "%s" "$1" | sed -E 's/^[[:space:]]*[^][(){}[:space:]]+//'
+}
+
+# provider label -> display name, e.g. "English (- (Crunchyroll))" -> "English (Crunchyroll)"
+subtitle_display_name() {
+    _label="$(printf "%s" "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ -z "$_label" ]; then
+        printf "Unknown Language"
+        return 0
+    fi
+    _name="$(subtitle_language_name "$(subtitle_head_word "$_label")")"
+    if [ -z "$_name" ]; then
+        # the label does not open with a language: keep it as the provider wrote it
+        printf "%s" "$_label"
+        return 0
+    fi
+    _rest="$(subtitle_strip_wrapping "$(subtitle_tail "$_label")")"
+    # "Chinese - Chinese (Simplified)": drop the repeated language word
+    _repeat="$(subtitle_language_name "$(subtitle_head_word "$_rest")")"
+    if [ -n "$_repeat" ]; then
+        _rest="$(subtitle_strip_wrapping "$(subtitle_tail "$_rest")")"
+    fi
+    if [ -n "$_rest" ]; then
+        printf "%s (%s)" "$_name" "$_rest"
+    else
+        printf "%s" "$_name"
+    fi
+}
+
+# embed json on stdin -> one line per subtitle track: name \t lang \t default \t url
+subtitle_tracks() {
+    _json="$(cat | tr -d '\n')"
+    printf "%s" "$_json" | grep -qE '"subtitles"[[:space:]]*:' || return 0
+    printf "%s" "$_json" | sed -E 's|.*"subtitles"[[:space:]]*:\[||; s|\][,}].*||; s|\},\{|\}\n\{|g' |
+        while IFS= read -r _entry || [ -n "$_entry" ]; do
+            _url="$(printf "%s" "$_entry" | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
+            [ -n "$_url" ] || continue
+            _label="$(printf "%s" "$_entry" | sed -nE 's|.*"label":"([^"]*)".*|\1|p')"
+            _lang="$(printf "%s" "$_entry" | sed -nE 's|.*"lang":"([^"]*)".*|\1|p')"
+            _is_default=0
+            printf "%s" "$_entry" | grep -q '"default":true' && _is_default=1
+            printf "%s\t%s\t%s\t%s\n" "$(subtitle_display_name "$_label")" "$_lang" "$_is_default" "$_url"
+        done
+}
+
+# drop duplicate urls and make every display name unique within the episode
+subtitle_unique() {
+    _seen_urls="|"
+    _seen_names="|"
+    while IFS="$(printf '\t')" read -r _name _lang _is_default _url; do
+        [ -n "$_url" ] || continue
+        case "$_seen_urls" in
+            *"|$_url|"*) continue ;;
+        esac
+        _seen_urls="$_seen_urls$_url|"
+        _base="$_name"
+        _candidate="$_base"
+        _suffix=1
+        _lower="$(printf "%s" "$_candidate" | tr '[:upper:]' '[:lower:]')"
+        while [ "${_seen_names#*"|$_lower|"}" != "$_seen_names" ]; do
+            _suffix=$((_suffix + 1))
+            _candidate="$_base ($_suffix)"
+            _lower="$(printf "%s" "$_candidate" | tr '[:upper:]' '[:lower:]')"
+        done
+        _seen_names="$_seen_names$_lower|"
+        printf "%s\t%s\t%s\t%s\n" "$_candidate" "$_lang" "$_is_default" "$_url"
+    done
+}
+
+# provider URL only says the format when its extension does
+subtitle_extension() {
+    case "$(printf "%s" "$1" | sed 's|[?#].*||' | sed -nE 's|.*\.([A-Za-z0-9]+)$|\1|p' | tr '[:upper:]' '[:lower:]')" in
+        vtt | webvtt) printf "vtt" ;;
+        srt | subrip) printf "srt" ;;
+        ass | ssa) printf "ass" ;;
+        *) printf "" ;;
+    esac
+}
+
+# format of a downloaded subtitle, from its content: prints the extension to use
+subtitle_file_format() {
+    if head -c 32 "$1" 2>/dev/null | grep -qi "WEBVTT"; then
+        printf "vtt"
+    elif grep -qF "[Script Info]" "$1" 2>/dev/null; then
+        printf "ass"
+    elif grep -q -- "-->" "$1" 2>/dev/null; then
+        printf "srt"
+    else
+        printf ""
+    fi
+}
+
+# download every track; sets sub_ready to name \t lang \t default \t file
+fetch_subtitles() {
+    sub_ready=""
+    [ -n "$sub_tracks" ] || return 0
+    _title_slug="$(printf "%s" "${anime_title:-ani-cli}" | tr '<>:"/\\|?*' '_')"
+    case "$player_function" in
+        download) _sub_dir="$download_dir" _sub_prefix="$_title_slug - episode $ep_no - " ;;
+        android_mpv) _sub_dir="/storage/emulated/0/mpv/subs" _sub_prefix="" ;;
+        *) _sub_dir="${ANI_CLI_SUB_DIR:-${TMPDIR:-/tmp}/ani-cli-subs}/$_title_slug-ep$ep_no" _sub_prefix="" ;;
+    esac
+    # the directory is shared storage on android and may be unwritable elsewhere
+    if ! mkdir -p "$_sub_dir" 2>/dev/null || [ ! -w "$_sub_dir" ]; then
+        _sub_dir="${TMPDIR:-/tmp}/ani-cli-subs/$_title_slug-ep$ep_no"
+        mkdir -p "$_sub_dir" 2>/dev/null || return 0
+    fi
+    info "Fetching subtitle tracks..."
+    while IFS="$(printf '\t')" read -r _name _lang _is_default _url; do
+        [ -n "$_url" ] || continue
+        _part="$_sub_dir/$_sub_prefix$_name.part"
+        # shellcheck disable=SC2086
+        if ! $curl_exe -sL -A "$agent" -e "$refr" --max-time 20 $cipher_flag "$_url" -o "$_part" 2>/dev/null; then
+            rm -f "$_part"
+            info "subtitle track '$_name' unavailable"
+            continue
+        fi
+        _ext="$(subtitle_file_format "$_part")"
+        if [ -z "$_ext" ] || ! grep -q -- "-->" "$_part" 2>/dev/null; then
+            # empty, truncated or not a subtitle: this track is skipped, the rest play
+            rm -f "$_part"
+            info "subtitle track '$_name' unavailable"
+            continue
+        fi
+        mv "$_part" "$_sub_dir/$_sub_prefix$_name.$_ext" 2>/dev/null || continue
+        sub_ready="$sub_ready$_name	$_lang	$_is_default	$_sub_dir/$_sub_prefix$_name.$_ext
+"
+    done <<EOF
+$sub_tracks
+EOF
+    sub_dir="$_sub_dir"
+    [ -n "$sub_ready" ] || info "No usable subtitle track for this episode"
+}
+
+# position of the track to preselect among the downloaded files, or "no"
+select_subtitle_sid() {
+    sub_sid="no"
+    [ -n "$sub_ready" ] || return 0
+    _pref="$(printf "%s" "${sub_lang_pref:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+    _position=0
+    _default_position=""
+    while IFS="$(printf '\t')" read -r _name _lang _is_default _path; do
+        [ -n "$_path" ] || continue
+        _position=$((_position + 1))
+        [ "$_is_default" = "1" ] && [ -z "$_default_position" ] && _default_position=$_position
+        # preference matches the track's own language code or the language in its name
+        if [ -n "$_pref" ]; then
+            _track_lang="$(printf "%s" "$_lang" | tr '[:upper:]' '[:lower:]')"
+            _name_lower="$(printf "%s" "$_name" | tr '[:upper:]' '[:lower:]')"
+            case "$_pref" in
+                "$_track_lang" | "$_track_lang"-*) [ "$sub_sid" = "no" ] && sub_sid=$_position ;;
+                *)
+                    case "$_name_lower" in
+                        "$_pref" | "$_pref "* | "$_pref"\(*) [ "$sub_sid" = "no" ] && sub_sid=$_position ;;
+                    esac
+                    ;;
+            esac
+        fi
+    done <<EOF
+$sub_ready
+EOF
+    # no preference and no provider default: leave subtitles off rather than
+    # silently enabling whichever track the provider listed first
+    [ "$sub_sid" = "no" ] && [ -n "$_default_position" ] && sub_sid=$_default_position
+    return 0
+}
+
+# mpv reads options from a file, which keeps paths with spaces intact
+write_sub_config() {
+    : >"$1"
+    while IFS="$(printf '\t')" read -r _name _lang _is_default _path; do
+        [ -n "$_path" ] || continue
+        printf "sub-file=%s\n" "$_path" >>"$1"
+    done <<EOF
+$sub_ready
+EOF
+    [ -n "${sub_sid:-}" ] && printf "sid=%s\n" "$sub_sid" >>"$1"
+    return 0
+}
+
+# every downloaded file, comma separated, for players that take one list argument
+subtitle_file_list() {
+    printf "%s\n" "$sub_ready" | cut -f 4 | grep -v '^$' | paste -sd, -
+}
+
 # PLAYING
 
 # Some CDNs serve HLS segments with a non-standard file extension (e.g. seg_00000.ts.jpg).
@@ -355,7 +619,6 @@ mpv_lavf_flags="--demuxer-lavf-o=extension_picky=0"
 # $1 = video link, $2 = video name, $3 = extra flags
 download() {
     _name="$(printf "%s" "$2" | tr '<>:"/\\|?*' '_')"
-    [ -n "$sub_link" ] && $curl_exe -sL -A "$agent" -e "$refr" --max-time 10 $cipher_flag "$sub_link" -o "$download_dir/$_name.vtt"
     [ -z "$audio_link" ] && command -v "yt-dlp" >/dev/null && yt-dlp --referer "$refr" "$1" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -P "$download_dir" -P "temp:$tmp_dir" -o "$_name.mp4" $3 && return 0
     ffmpeg -extension_picky 0 -referer "$refr" -loglevel error -stats -i "$1" ${audio_link:+-extension_picky 0 -referer "$refr" -i "$audio_link"} -c copy "$download_dir/$_name.mp4" $3
 }
@@ -366,7 +629,15 @@ android_mpv() {
     _conf_dir="/storage/emulated/0/mpv"
     if [ -w "${_conf_dir%/mpv}" ]; then
         [ -d "$_conf_dir" ] || mkdir "$_conf_dir"
-        printf "referrer=%s\n%s\n%s\n%s\n" "$refr" "${sub_link:+sub-file=$sub_link}" "${audio_link:+audio-file=$audio_link}" "${mpv_lavf_flags#--demuxer-lavf-o=}" >"$_conf_dir/mpv.config.mp4"
+        {
+            printf "referrer=%s\n%s\n%s\n" "$refr" "${audio_link:+audio-file=$audio_link}" "${mpv_lavf_flags#--demuxer-lavf-o=}"
+            while IFS="$(printf '\t')" read -r _name _lang _is_default _path; do
+                [ -n "$_path" ] && printf "sub-file=%s\n" "$_path"
+            done <<EOF
+$sub_ready
+EOF
+            [ -n "${sub_sid:-}" ] && printf "sid=%s\n" "$sub_sid"
+        } >"$_conf_dir/mpv.config.mp4"
     fi
     nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 &
 }
@@ -374,37 +645,81 @@ android_mpv() {
 play_episode() {
     [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${anime_title} ${ep_no}"
     [ -z "$video_link" ] && get_video_link
+    # every track is fetched once per episode, named after its provider label, so the
+    # player can list and switch them without another round trip
+    [ -n "$sub_tracks" ] && [ -z "$sub_ready" ] && fetch_subtitles
+    select_subtitle_sid
+    _sub_conf="${sub_dir:-${TMPDIR:-/tmp}}/subtitles.conf"
+    # a download keeps the files next to the video; only players need the config
+    [ "$player_function" = "download" ] || write_sub_config "$_sub_conf"
     [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -i "$mal_id" -e "$ep_no")"
     # wait for the previous player to close (in range selection)
     wait
     # shellcheck disable=SC2086
     case "$player_function" in
-        debug) printf "All links:\n%s\nSelected link:\n%s\nAudio:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$audio_link" "$sub_link" ;;
+        debug)
+            printf "All links:\n%s\nSelected link:\n%s\nAudio:\n%s\nSubtitles (%s tracks, preselected: %s):\n%s\n" \
+                "$links" "$video_link" "$audio_link" \
+                "$(printf "%s" "$sub_ready" | grep -c .)" "${sub_sid:-no}" \
+                "$(printf "%s" "$sub_ready" | sed "s|${_tab}| > |g")"
+            ;;
         android_mpv) android_mpv ;;
         android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv $mpv_lavf_flags --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
+        *flatpak*mpv*)
+            # built with set -- so a subtitle path with spaces stays one argument
+            set -- $mpv_lavf_flags --referrer="$refr"
+            [ -n "$audio_link" ] && set -- "$@" --audio-file="$audio_link"
+            [ -n "$sub_ready" ] && set -- "$@" --include="$_sub_conf"
+            set -- "$@" $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+            flatpak run io.mpv.Mpv "$@" >/dev/null 2>&1 &
+            ;;
         *mpv*)
+            set -- $mpv_lavf_flags --referrer="$refr"
+            [ -n "$audio_link" ] && set -- "$@" --audio-file="$audio_link"
+            [ -n "$sub_ready" ] && set -- "$@" --include="$_sub_conf"
+            set -- "$@" $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $mpv_lavf_flags --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function "$@" >/dev/null 2>&1 &
             else
-                $player_function $mpv_lavf_flags --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+                $player_function "$@"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
             fi
             ;;
         *iina*)
-            # mpv splits sub-files on ':', so the url has to be escaped for iina
-            _sub_iina="$(printf "%s" "$sub_link" | sed 's|:|\\:|g')"
-            _audio_iina="$(printf "%s" "$audio_link" | sed 's|:|\\:|g')"
+            # mpv (and so IINA) splits option lists on ':', so paths are escaped
+            set -- --mpv-referrer="$refr" $player_extra_flags
+            [ -n "$audio_link" ] && set -- "$@" --mpv-audio-files="$(printf "%s" "$audio_link" | sed 's|:|\\:|g')"
+            if [ -n "$sub_ready" ]; then
+                set -- "$@" --mpv-sub-files="$(subtitle_file_list | sed 's|:|\\:|g')"
+                [ "$sub_sid" != "no" ] && set -- "$@" --mpv-sid="$sub_sid"
+            fi
             if pgrep -f "IINA" >/dev/null 2>&1; then
                 # omit --keep-running when an IINA instance exists to prevent hanging
-                nohup $player_function --mpv-referrer="$refr" ${_audio_iina:+--mpv-audio-files="$_audio_iina"} ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function "$@" --no-stdin --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                nohup $player_function --mpv-referrer="$refr" ${_audio_iina:+--mpv-audio-files="$_audio_iina"} ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --keep-running --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function "$@" --no-stdin --keep-running --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             fi
             ;;
-        *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$video_link" :input-slave="${audio_link:+$audio_link#}$sub_link" >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag $mpv_lavf_flags --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;
+        *vlc*)
+            set -- --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}"
+            [ -n "$audio_link" ] && set -- "$@" :input-slave="$audio_link"
+            if [ -n "$sub_ready" ]; then
+                while IFS="$(printf '\t')" read -r _name _lang _is_default _path; do
+                    [ -n "$_path" ] && set -- "$@" --sub-file="$_path"
+                done <<EOF
+$sub_ready
+EOF
+            fi
+            nohup $player_function "$@" "$video_link" >/dev/null 2>&1 &
+            ;;
+        *yncpla*)
+            set -- $player_extra_flags "$video_link" -- $skip_flag $mpv_lavf_flags --referrer="$refr"
+            [ -n "$audio_link" ] && set -- "$@" --audio-file="$audio_link"
+            [ -n "$sub_ready" ] && set -- "$@" --include="$_sub_conf"
+            set -- "$@" --force-media-title="${anime_title} Episode ${ep_no}"
+            nohup $player_function "$@" >/dev/null 2>&1 &
+            ;;
         download) "$player_function" "$video_link" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
         catt) nohup catt cast $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
         iSH)
@@ -447,6 +762,12 @@ play() {
     [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput rc && tput ed
 }
 
+# when sourced by the test suite only the functions are wanted, not the main flow
+if [ "${ANI_CLI_LIB_ONLY:-0}" = 1 ]; then
+    # shellcheck disable=SC2317  # reached only when the file is sourced
+    return 0 2>/dev/null || exit 0
+fi
+
 # MAIN
 
 # setup
@@ -463,6 +784,7 @@ download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
 tmp_dir="${ANI_CLI_TMP_DIR:-.}"
 log_episode="${ANI_CLI_LOG:-1}"
 quality="${ANI_CLI_QUALITY:-best}"
+sub_lang_pref="${ANI_CLI_SUB_LANG:-}"
 exact_match="${ANI_CLI_EXACT:-0}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
@@ -525,6 +847,11 @@ while [ $# -gt 0 ]; do
         -q | --quality)
             [ $# -lt 2 ] && die "missing argument!"
             quality="$2"
+            shift
+            ;;
+        -L | --sub-lang)
+            [ $# -lt 2 ] && die "missing argument!"
+            sub_lang_pref="$2"
             shift
             ;;
         -S | --select-nth)

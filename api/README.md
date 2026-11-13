@@ -34,7 +34,7 @@ Existing (unchanged shapes):
 | GET | `/v1/streams/{episode_id}` | resolve + segment proof |
 | GET | `/v1/stream/{token}/master.m3u8` | rewritten master playlist |
 | GET | `/v1/stream/{token}/media.m3u8` | media playlist |
-| GET | `/v1/subtitles/{token}.vtt` | subtitle proxy |
+| GET | `/v1/subtitles/{token}.vtt` | one subtitle track, always served as WebVTT |
 | GET | `/health`, `/health/providers`, `/metrics`, `/v1/admin/*` | ops |
 
 New, MyAnimeList based:
@@ -150,3 +150,72 @@ python -m pytest -m network         # live: real HiAnime, ZokoAnime and segments
 Offline tests use a fake metadata source and inspect decision logic only; they never
 claim a real stream. Live tests fail (or report `PROVIDER_OBJECT_BLOCKED`) honestly when
 the provider refuses an object.
+
+
+## Subtitles
+
+A stream response carries **every** subtitle track the provider lists for the
+episode, in the provider's order, and nothing is filtered by language:
+
+```json
+"subtitle_count": 5,
+"subtitle_default_id": "sub-3",
+"subtitles": [
+  {
+    "id": "sub-1", "index": 0,
+    "label": "English (- (Crunchyroll))",   // provider's own label, verbatim
+    "title": "English (Crunchyroll)",       // display title, unique per episode
+    "language": "en", "language_name": "English",
+    "language_source": "provider_label", "kind": "full",
+    "provider_lang": "en",                  // provider's own lang, verbatim
+    "format": "vtt", "format_source": "url_extension", "format_served": "vtt",
+    "converted": false, "playable": true, "default": false,
+    "url": "https://dramahot.top/.../English.vtt",
+    "proxied_url": "/v1/subtitles/<signed token>.vtt"
+  }
+]
+```
+
+Mapping rules, each traceable to what the provider actually returns:
+
+- `label` is copied exactly. `title` is derived from it: the leading language word is
+  canonicalised and a repeated language word or provider noise is dropped, so
+  `English (- (Crunchyroll))` becomes `English (Crunchyroll)` and
+  `Chinese - Chinese (Simplified)` becomes `Chinese (Simplified)`. Two tracks that
+  would otherwise share a title get a numeric suffix (`Spanish`, `Spanish (2)`).
+- `provider_lang` is preserved but **never** used as the track language. Measured on
+  2026-11-13: the provider sends `"lang": "en"` on all 40 tracks sampled across eight
+  languages, including tracks labelled Arabic, Thai and Japanese. Only the label
+  identifies a language; a label that names none reports `language: "und"`,
+  `language_name: "Unknown Language"` and `language_source: "unknown"`. Nothing is
+  guessed and nothing is verified against the audio: there is no speech recognition,
+  transcription or language detection anywhere in this service.
+- `kind` is `full`, `signs`, `forced` or `dubtitle` when the label says so, `full`
+  otherwise.
+- `format` comes from the track's own URL extension (`vtt`, `srt`, `ass`). When the
+  URL states none, up to three tracks are sniffed by content (`format_source:
+  "sniffed"`); a track that still cannot be identified keeps `format: "unknown"` and
+  `playable: false` rather than claiming to be playable.
+- `default` is the provider's own flag, passed through, used to fill
+  `subtitle_default_id`. No track is treated as default merely for being first.
+- Each track has its own signed `proxied_url`. The proxy fetches with the provider's
+  referrer, converts SRT and ASS/SSA to WebVTT, and serves `text/vtt` with an
+  `X-Subtitle-Source-Format` header.
+
+Failure modes are per track and never affect the stream response:
+
+| Case | Result |
+|---|---|
+| upstream refuses (403/404) | `502 SUBTITLE_FETCH_FAILED` |
+| upstream body empty | `502 SUBTITLE_EMPTY` |
+| unparseable / non-subtitle body | `415 SUBTITLE_FORMAT_UNSUPPORTED` |
+| token expired | `410 TOKEN_EXPIRED` |
+| token tampered | `403` |
+| host not produced by an adapter | `400 HOST_NOT_ALLOWED` |
+
+Limitations: the provider's `lang` field carries no usable information today, so a
+label that names no language cannot be attributed to one. ASS styling (fonts,
+positioning, karaoke) is flattened to plain WebVTT text; signs and songs are only
+distinguished when the provider's label says so. A subtitle token expires with the
+stream token, so a player that reloads a track after the token lifetime must request
+the stream again.

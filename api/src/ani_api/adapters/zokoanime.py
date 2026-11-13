@@ -20,6 +20,7 @@ from ..config import settings
 from ..errors import embed_decode_failed, no_stream, upstream_blocked
 from ..http_client import LoopClient
 from ..models import SubtitleTrack
+from ..services.subtitles import non_subtitle_url
 from .base import StreamSet
 from .playlist import parse_audio_tracks, parse_master
 
@@ -56,10 +57,31 @@ class ZokoAnimeAdapter:
         master = payload.get("src") or ""
         if not master:
             raise no_stream("embed payload has no src")
-        subs = []
-        for s in payload.get("subtitles") or []:
-            if s.get("src"):
-                subs.append(SubtitleTrack(url=s["src"], default=bool(s.get("default"))))
+        # Keep every track, in the provider's order. The provider's own label and
+        # lang fields are preserved verbatim; language handling happens later, where
+        # the label is parsed. Nothing is dropped for being non-English: an episode
+        # that lists one track yields one and an episode that lists ten yields ten.
+        sprite = payload.get("sprite_vtt") or ""
+        subs: list[SubtitleTrack] = []
+        for entry in payload.get("subtitles") or []:
+            if not isinstance(entry, dict):
+                continue
+            src = entry.get("src")
+            if not isinstance(src, str) or not src.strip():
+                continue                       # no URL means no playable track
+            src = src.strip()
+            if src == sprite or non_subtitle_url(src):
+                continue                       # thumbnail sprite, not a subtitle
+            label = entry.get("label")
+            provider_lang = entry.get("lang")
+            subs.append(SubtitleTrack(
+                url=src,
+                label=label.strip() if isinstance(label, str) and label.strip() else None,
+                provider_lang=(provider_lang.strip()
+                               if isinstance(provider_lang, str) and provider_lang.strip()
+                               else None),
+                default=bool(entry.get("default")),
+            ))
 
         # the master playlist is only served to the embed origin
         pr = await self._http.client.get(master, headers={"Referer": referer})
