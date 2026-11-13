@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+mal_mappings.sqlite3
+mal_mappings.sqlite3-journal
