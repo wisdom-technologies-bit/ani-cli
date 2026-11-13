@@ -26,11 +26,12 @@ from ..adapters.playlist import parse_first_segment
 from ..breaker import CircuitBreaker
 from ..cache import cache
 from ..config import settings
-from ..errors import AniError, no_stream, object_blocked_segment
+from ..errors import AniError, mal_episode_mismatch, no_stream, object_blocked_segment
 from ..http_client import LoopClient
-from ..models import (AudioInfo, DownloadInfo, StreamResponse, SubtitleTrack, UrlLifetime,
-                      Validation, Variant)
+from ..models import (AudioInfo, DownloadInfo, MalContext, MalPart, StreamResponse,
+                      SubtitleTrack, UrlLifetime, Validation, Variant)
 from ..singleflight import SingleFlight
+from .mal import parse_embed_mal
 from .security import sign_payload
 
 # Measured 2026-11-12 by repeated real requests: a URL was still serving at ~28
@@ -114,7 +115,9 @@ class StreamService:
     # ---------- public entry point ----------
     async def resolve(self, *, episode_id: str, audio: str, quality: str, request_id: str,
                       anime_id: str = "", episode_number: str | None = None,
-                      refresh: bool = False) -> StreamResponse:
+                      refresh: bool = False,
+                      mal_expect: tuple[int, int] | None = None,
+                      mal_part: MalPart | None = None) -> StreamResponse:
         started = time.time()
         key = f"r:{episode_id}:{audio}:{_norm_quality(quality)}"
         cached = None if refresh else await cache.get(key)
@@ -126,7 +129,8 @@ class StreamService:
                 payload["cache"] = {"hit": True, "age_seconds": int(age), "validated_by": "cached_probe"}
                 payload["request_id"] = request_id
                 obs.counter("resolve_total", {"audio": audio, "result": "cache_hit"})
-                return StreamResponse(**payload)
+                return self._apply_mal(StreamResponse(**payload), cached.get("embed_mal"),
+                                       mal_expect, mal_part, episode_id)
             probe = await self.probe_segment(cached["segment_url"], cached.get("referer"))
             if probe["reachable"]:
                 payload = cached["payload"]
@@ -137,7 +141,8 @@ class StreamService:
                 cached["validated_ts"] = time.time()
                 await cache.set(key, cached, settings.ttl_stream)
                 obs.counter("resolve_total", {"audio": audio, "result": "cache_revalidated"})
-                return StreamResponse(**payload)
+                return self._apply_mal(StreamResponse(**payload), cached.get("embed_mal"),
+                                       mal_expect, mal_part, episode_id)
             await cache.delete(key)
             obs.counter("cache_stale_invalidated_total")
 
@@ -148,7 +153,8 @@ class StreamService:
             return await self._resolve_uncached(episode_id=episode_id, audio=audio,
                                                 quality=quality, request_id=request_id,
                                                 anime_id=anime_id, episode_number=episode_number,
-                                                produced_from_key=key)
+                                                produced_from_key=key, mal_expect=mal_expect,
+                                                mal_part=mal_part)
 
         try:
             payload, shared = await self.sf.do(key, work)
@@ -170,7 +176,9 @@ class StreamService:
     # ---------- the actual work ----------
     async def _resolve_uncached(self, *, episode_id: str, audio: str, quality: str,
                                 request_id: str, anime_id: str, episode_number: str | None,
-                                produced_from_key: str) -> StreamResponse:
+                                produced_from_key: str,
+                                mal_expect: tuple[int, int] | None = None,
+                                mal_part: MalPart | None = None) -> StreamResponse:
         servers = await self.metadata.servers(episode_id, audio)  # type: ignore[arg-type]
         usable = [s for s in servers if s.supported]
         if not usable:
@@ -191,6 +199,17 @@ class StreamService:
 
         hash_b64 = await self.metadata.server_hash(episode_id, audio, server.name)  # type: ignore[attr-defined]
         embed_url = base64.b64decode(hash_b64 + "=" * (-len(hash_b64) % 4)).decode()
+        # The embed path names the MAL episode the provider is actually serving. When a
+        # MAL episode was requested, a disagreement is a wrong-episode bug, not a stream.
+        parsed_embed = parse_embed_mal(embed_url)
+        embed_mal = None
+        if parsed_embed:
+            embed_mal = {"mal_id": parsed_embed[0], "episode": parsed_embed[1],
+                         "audio": parsed_embed[2]}
+            if mal_expect and (embed_mal["mal_id"], embed_mal["episode"]) != tuple(mal_expect):
+                obs.counter("mal_stream_mismatch_total")
+                raise mal_episode_mismatch(str(mal_expect[0]), str(mal_expect[1]),
+                                           f"/mal/{embed_mal['mal_id']}/{embed_mal['episode']}/")
         try:
             streams = await adapter.resolve(embed_url)
         except AniError:
@@ -308,9 +327,44 @@ class StreamService:
             warnings=[],
         )
         await cache.set(produced_from_key,
-                        {"payload": payload.model_dump(), "segment_url": chosen_segment,
+                        {"payload": payload.model_dump(exclude={"mal"}),
+                         "segment_url": chosen_segment,
                          "referer": streams.referer, "validated_ts": time.time(),
-                         "master_url": streams.master_url}, settings.ttl_stream)
+                         "master_url": streams.master_url, "embed_mal": embed_mal},
+                        settings.ttl_stream)
+        return self._apply_mal(payload, embed_mal, mal_expect, mal_part, episode_id)
+
+    def _apply_mal(self, payload: StreamResponse, embed_mal: dict | None,
+                   mal_expect: tuple[int, int] | None, mal_part: MalPart | None,
+                   episode_id: str) -> StreamResponse:
+        """Attach the MAL view of this stream, or clear it for non-MAL requests.
+
+        The cache is shared by episode id, so a box from another request must never leak
+        into this response: MAL context is always recomputed from the cached embed, not
+        trusted from the stored payload.
+        """
+        if mal_expect is None:
+            payload.mal = None
+            return payload
+        mal_id, mal_episode = int(mal_expect[0]), int(mal_expect[1])
+        if embed_mal:
+            if (embed_mal.get("mal_id"), embed_mal.get("episode")) != (mal_id, mal_episode):
+                raise mal_episode_mismatch(str(mal_id), str(mal_episode),
+                                          f"/mal/{embed_mal.get('mal_id')}/{embed_mal.get('episode')}/")
+            verified, why = True, "provider_embed"
+            evidence = (f"embed /mal/{mal_id}/{mal_episode}/{embed_mal.get('audio', 'sub')}"
+                        f" on episode {episode_id}")
+            note = "the stream served proves it is this MAL episode"
+        else:
+            verified, why = False, "mapping_only"
+            evidence = None
+            note = ("serving server exposes no MAL id in its embed; episode identity rests on "
+                    "the stored mapping, not on this stream")
+        payload.mal = MalContext(
+            mal_id=mal_id, mal_episode=mal_episode,
+            hianime_id=(mal_part.hianime_id if mal_part else payload.anime_id),
+            episode_id=episode_id, part=mal_part, stream_verified=verified,
+            verification=why, evidence=evidence, note=note)
         return payload
 
     async def aclose(self) -> None:

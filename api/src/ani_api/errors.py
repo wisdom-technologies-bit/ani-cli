@@ -43,3 +43,58 @@ def object_blocked_segment(*, quality: str, http_code: int, cached: bool) -> Ani
                     stage="segment", provider="zokoanime", retryable=False,
                     detail=f"quality {quality}: first segment HTTP {http_code}"
                            + (" (edge-cached 403; retrying the same URL will keep failing)" if cached else ""))
+
+
+# ---------- MAL id taxonomy ----------
+# Each of these is a distinct, actionable outcome. None of them ever falls back to
+# "closest title match": an unproven mapping is reported, never guessed.
+def mal_not_found(mal_id: str) -> AniError:
+    return AniError(404, "MAL_NOT_FOUND", "Unknown MAL id",
+                    stage="mal_lookup", provider="anilist",
+                    detail=f"MAL id {mal_id} is not a known anime entry")
+
+
+def mal_title_source_disabled() -> AniError:
+    return AniError(503, "MAL_TITLE_SOURCE_DISABLED",
+                    "No title source configured for MAL discovery",
+                    stage="mal_lookup", provider="config",
+                    detail="ANI_API_MAL_TITLE_SOURCE is off and no stored mapping exists")
+
+
+def mal_title_source_unavailable(detail: str = "") -> AniError:
+    return AniError(503, "MAL_TITLE_SOURCE_UNAVAILABLE",
+                    "MAL metadata lookup temporarily unavailable",
+                    stage="mal_lookup", provider="anilist", retryable=True,
+                    retry_after=30, detail=detail)
+
+
+def mal_not_mapped(mal_id: str, tried: list[str], detail: str = "") -> AniError:
+    return AniError(404, "MAL_NOT_MAPPED",
+                    "No verified HiAnime mapping for this MAL id",
+                    stage="mal_mapping", provider="hianime",
+                    detail=(f"no HiAnime candidate proved MAL id {mal_id} via provider embed"
+                            + (f"; candidates tried: {', '.join(tried)}" if tried else "")
+                            + (f"; {detail}" if detail else "")))
+
+
+def mal_ambiguous(mal_id: str, options: list[str]) -> AniError:
+    return AniError(409, "MAL_MAPPING_AMBIGUOUS",
+                    "Several HiAnime entries claim the same MAL id",
+                    stage="mal_mapping", provider="hianime",
+                    detail=("refusing to guess; overlapping verified options: "
+                            + ", ".join(options)))
+
+
+def mal_episode_not_found(mal_id: str, number: str, available: str) -> AniError:
+    return AniError(404, "MAL_EPISODE_NOT_FOUND",
+                    "Episode not present in the verified mapping",
+                    stage="mal_episode", provider="hianime",
+                    detail=f"MAL {mal_id} has no episode {number}; available: {available}")
+
+
+def mal_episode_mismatch(mal_id: str, number: str, found: str) -> AniError:
+    return AniError(409, "MAL_EPISODE_MISMATCH",
+                    "Provider embed disagrees with the requested MAL episode",
+                    stage="mal_episode", provider="zokoanime",
+                    detail=(f"asked for MAL {mal_id} episode {number}, provider embed serves "
+                            f"{found}; not returning a possibly wrong episode"))
