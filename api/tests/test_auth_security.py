@@ -69,17 +69,57 @@ def test_forwarded_header_cannot_impersonate_loopback(client):
     assert r.status_code == 503, r.text
 
 
-def test_every_v1_route_requires_access():
-    """Structural guarantee: no protected surface can be added without auth."""
+def test_every_route_declares_access_dependency():
+    """Belt: every documented route declares require_access on itself."""
     unprotected = []
     for route in app.routes:
         path = getattr(route, "path", "")
-        if not (path.startswith("/v1") or path == "/metrics" or path == "/health/providers"):
+        if not path or path in {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}:
             continue
-        calls = [d.call for d in getattr(route, "dependant", None).dependencies] if getattr(route, "dependant", None) else []
+        dependant = getattr(route, "dependant", None)
+        calls = [d.call for d in dependant.dependencies] if dependant else []
         if require_access not in calls:
             unprotected.append(path)
     assert not unprotected, f"routes missing auth: {unprotected}"
+
+
+def _concrete(path: str) -> str:
+    """Fill path params with harmless values; auth must reject before any handler runs."""
+    return (path.replace("{episode_id}", "1").replace("{anime_id}", "x-1")
+            .replace("{mal_id}", "21").replace("{episode_number}", "1")
+            .replace("{token}", "t").replace("{q}", "x"))
+
+
+def test_every_endpoint_refuses_an_anonymous_caller(client):
+    """Braces: hitting every documented path without a key returns 401, no exceptions.
+
+    This covers /health, /metrics, the MAL routes, stream resolution and the HLS /
+    subtitle proxies - the surface the API key must protect end to end.
+    """
+    settings.api_keys = {"key-alpha"}
+    paths = sorted(app.openapi()["paths"])
+    refused = {}
+    for path in paths:
+        concrete = _concrete(path)
+        r = client.get(concrete)
+        if r.status_code != 401:
+            refused[path] = r.status_code
+    assert not refused, f"endpoints that did not demand a key: {refused}"
+
+
+def test_docs_and_schema_are_protected(client):
+    settings.api_keys = {"key-alpha"}
+    for path in ("/docs", "/openapi.json", "/redoc"):
+        assert client.get(path).status_code == 401, path
+    assert client.get("/openapi.json", headers={"x-api-key": "key-alpha"}).status_code == 200
+
+
+def test_no_key_configured_still_refuses_remote_proxy_call(client):
+    """The proxy surface follows the same policy as the rest of the API."""
+    settings.api_keys = set()
+    r = client.get("/v1/stream/tok/master.m3u8", headers={"x-forwarded-for": "203.0.113.5"})
+    assert r.status_code == 503
+    assert r.json()["code"] == "AUTH_NOT_CONFIGURED"
 
 
 def test_rate_limit_returns_429(client, monkeypatch):

@@ -98,3 +98,47 @@ def assert_allowed_host(url: str, allow: set[str]) -> None:
     host = (urlsplit(url).hostname or "").lower()
     if not any(host == a or host.endswith("." + a) for a in allow):
         raise AniError(400, "HOST_NOT_ALLOWED", "Refusing to proxy an unlisted host", detail=host)
+
+
+def problem_body(exc: "AniError", path: str, request_id: str = "") -> dict:
+    """RFC 9457-ish body, shared by the exception handler and the key middleware."""
+    body = dict(exc.detail) if isinstance(exc.detail, dict) else {"detail": str(exc.detail)}
+    body.update({"status": exc.status_code, "instance": path, "request_id": request_id})
+    return body
+
+
+class ApiKeyMiddleware:
+    """Enforces the API key on every HTTP request, including routes added later.
+
+    Route-level dependencies are kept as documentation and defence in depth, but a new
+    endpoint cannot forget authentication: the decision is made here, above the router,
+    so /health, the HLS proxies, /metrics and even /docs are covered by construction.
+    The response is built here as well, because an exception raised above the router
+    would bypass FastAPI's exception handlers.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+
+        request = Request(scope)
+        try:
+            await require_access(request)
+        except AniError as exc:
+            request_id = request.headers.get("x-request-id", "")
+            headers = {"x-request-id": request_id} if request_id else {}
+            if isinstance(exc.detail, dict) and exc.detail.get("retry_after"):
+                headers["Retry-After"] = str(exc.detail["retry_after"])
+            response = JSONResponse(
+                status_code=exc.status_code,
+                content=problem_body(exc, str(request.url.path), request_id),
+                media_type="application/problem+json", headers=headers)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)

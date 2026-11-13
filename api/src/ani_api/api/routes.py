@@ -1,6 +1,7 @@
 """HTTP surface. Every route is access-controlled; there is no anonymous public mode."""
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from urllib.parse import urljoin
@@ -15,9 +16,11 @@ from ..adapters.hianime import HianimeAdapter
 from ..adapters.playlist import parse_master
 from ..adapters.zokoanime import ZokoAnimeAdapter
 from ..config import settings
-from ..errors import AniError
+from ..errors import AniError, mal_episode_mismatch
 from ..http_client import LoopClient
-from ..models import AnimeDetail, AnimeRef, EpisodeRef, ServerRef, StreamResponse
+from ..models import (AnimeDetail, AnimeRef, EpisodeRef, MalAnimeDetail, MalEpisodeRef,
+                      ServerRef, StreamResponse)
+from ..services.mal import MalResolver
 from ..services.security import assert_allowed_host, enforce_rate_limit, require_access, sign_payload, verify_token
 from ..services.streams import StreamService
 from .. import obs
@@ -31,6 +34,7 @@ ALLOWED_HOSTS = {"dramahot.top", "drama1.cfd", "hianime.at"}
 _metadata = HianimeAdapter()
 _zoko = ZokoAnimeAdapter()
 _service = StreamService(_metadata, {"zokoanime": _zoko})
+_mal = MalResolver(_metadata)
 _proxy_http = LoopClient()
 
 
@@ -39,7 +43,7 @@ def rid(request: Request) -> str:
 
 
 @router.get("/health", summary="Liveness; never touches an upstream")
-async def health() -> dict:
+async def health(_: None = Depends(require_access)) -> dict:
     return {"status": "ok", "version": "0.1.0"}
 
 
@@ -76,6 +80,22 @@ async def search(request: Request, q: str = Query(..., min_length=2),
     return (await _metadata.search(q))[:limit]
 
 
+@router.get("/v1/anime/mal/{mal_id}", response_model=MalAnimeDetail,
+            summary="Anime metadata by MyAnimeList id")
+async def mal_anime_detail(mal_id: int = Path(ge=1, le=2_000_000_000),
+                           refresh: bool = Query(False, description="re-verify the mapping upstream"),
+                           _: None = Depends(require_access)) -> MalAnimeDetail:
+    return await _mal.anime_detail(mal_id, refresh=refresh)
+
+
+@router.get("/v1/anime/mal/{mal_id}/episodes", response_model=list[MalEpisodeRef],
+            summary="Episode list by MyAnimeList id, with HiAnime episode ids")
+async def mal_anime_episodes(mal_id: int = Path(ge=1, le=2_000_000_000),
+                             refresh: bool = Query(False),
+                             _: None = Depends(require_access)) -> list[MalEpisodeRef]:
+    return await _mal.episodes(mal_id, refresh=refresh)
+
+
 @router.get("/v1/anime/{anime_id}", response_model=AnimeDetail)
 async def anime_detail(anime_id: str, _: None = Depends(require_access)) -> AnimeDetail:
     episodes = await _metadata.episodes(anime_id)
@@ -91,6 +111,39 @@ async def anime_episodes(anime_id: str, _: None = Depends(require_access)) -> li
 async def episode_servers(episode_id: str = Path(pattern=r"^[0-9]{1,12}$"), audio: str = Query("sub", pattern="^(sub|dub)$"),
                           _: None = Depends(require_access)) -> list[ServerRef]:
     return await _metadata.servers(episode_id, audio)  # type: ignore[arg-type]
+
+
+@router.get("/v1/streams/mal/{mal_id}/episode/{episode_number}", response_model=StreamResponse,
+            summary="Resolve a MAL episode end to end, verified against the provider embed")
+async def mal_stream(request: Request, mal_id: int = Path(ge=1, le=2_000_000_000),
+                     episode_number: int = Path(ge=0, le=100_000),
+                     audio: str = Query("sub", pattern="^(sub|dub)$"),
+                     quality: str = Query("best"),
+                     refresh: bool = Query(False),
+                     _: None = Depends(require_access)) -> StreamResponse:
+    await enforce_rate_limit(request)
+    candidates = await _mal.episodes_for_stream(mal_id, episode_number, refresh=refresh)
+    tried: list[str] = []
+    for candidate in candidates:
+        try:
+            response = await _service.resolve(
+                episode_id=candidate.episode_id, audio=audio, quality=quality,
+                request_id=rid(request), anime_id=candidate.hianime_id,
+                episode_number=str(episode_number), refresh=refresh,
+                mal_expect=(mal_id, episode_number), mal_part=candidate.part)
+        except AniError as exc:
+            code = exc.detail.get("code") if isinstance(exc.detail, dict) else ""
+            if code == "MAL_EPISODE_MISMATCH":
+                tried.append(f"{candidate.hianime_id}/{candidate.episode_id}")
+                continue
+            raise
+        if response.mal and response.mal.stream_verified:
+            await _mal.record_episode(mal_id, episode_number, candidate.hianime_id,
+                                      candidate.episode_id,
+                                      response.mal.evidence or "provider embed")
+        return response
+    raise mal_episode_mismatch(str(mal_id), str(episode_number),
+                               "no candidate matched (tried: " + ", ".join(tried) + ")")
 
 
 @router.get("/v1/streams/{episode_id}", response_model=StreamResponse,
@@ -116,6 +169,16 @@ async def providers(_: None = Depends(require_access)) -> dict:
     return {name: await br.snapshot() for name, br in _service.breakers.items()}
 
 
+@router.get("/v1/admin/mal", summary="MAL mapping store state")
+async def mal_admin(_: None = Depends(require_access)) -> dict:
+    store = _mal.store
+    return {"backend": "sqlite", "path": store.path, "persistent": store.persistent,
+            "rows": await asyncio.to_thread(store.stats),
+            "title_source": settings.mal_title_source,
+            "verified_by": "zokoanime_embed",
+            "note": "only embeddings that proved the MAL id are stored"}
+
+
 @router.get("/v1/admin/lifetime", summary="Measured URL lifetime curve")
 async def lifetime(_: None = Depends(require_access)) -> dict:
     rows = read_rows(FsPath(settings.prober_out))
@@ -124,7 +187,7 @@ async def lifetime(_: None = Depends(require_access)) -> dict:
 
 
 @router.get("/v1/stream/{token}/master.m3u8", response_class=PlainTextResponse)
-async def proxied_master(token: str) -> PlainTextResponse:
+async def proxied_master(token: str, _: None = Depends(require_access)) -> PlainTextResponse:
     """Master playlist, Referer applied server-side, variants rewritten to this API."""
     payload = verify_token(token)
     assert_allowed_host(payload["u"], ALLOWED_HOSTS)
@@ -144,7 +207,7 @@ async def proxied_master(token: str) -> PlainTextResponse:
 
 
 @router.get("/v1/stream/{token}/media.m3u8", response_class=PlainTextResponse)
-async def proxied_media(token: str) -> PlainTextResponse:
+async def proxied_media(token: str, _: None = Depends(require_access)) -> PlainTextResponse:
     payload = verify_token(token)
     assert_allowed_host(payload["u"], ALLOWED_HOSTS)
     r = await _proxy_http.client.get(payload["u"], headers={"Referer": payload["r"]})
@@ -155,7 +218,7 @@ async def proxied_media(token: str) -> PlainTextResponse:
 
 
 @router.get("/v1/subtitles/{token}.vtt", response_class=PlainTextResponse)
-async def proxied_subtitles(token: str) -> PlainTextResponse:
+async def proxied_subtitles(token: str, _: None = Depends(require_access)) -> PlainTextResponse:
     payload = verify_token(token)
     assert_allowed_host(payload["u"], ALLOWED_HOSTS)
     r = await _proxy_http.client.get(payload["u"], headers={"Referer": payload["r"]})

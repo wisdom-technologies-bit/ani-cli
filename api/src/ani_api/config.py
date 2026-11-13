@@ -46,6 +46,15 @@ class Settings:
     reextract_min_age: int = _int("ANI_API_REEXTRACT_MIN_AGE", 600)
     segment_probe_bytes: int = 1024
 
+    # MAL id support. The mapping database is a small SQLite file so verified
+    # mappings survive restarts; on an ephemeral filesystem it is rebuilt on demand.
+    mapping_db: str = os.environ.get("ANI_API_MAPPING_DB", "mal_mappings.sqlite3")
+    mal_title_source: str = os.environ.get("ANI_API_MAL_TITLE_SOURCE", "anilist").strip().lower()
+    anilist_url: str = os.environ.get("ANI_API_ANILIST_URL", "https://graphql.anilist.co")
+    mal_candidates: int = _int("ANI_API_MAL_CANDIDATES", 6)   # HiAnime candidates verified per MAL id
+    mal_verify_concurrency: int = _int("ANI_API_MAL_VERIFY_CONCURRENCY", 3)
+    ttl_mal_mapping: int = _int("ANI_API_TTL_MAL_MAPPING", 604800)
+
     # limits
     rate_limit_per_minute: int = _int("ANI_API_RATE_LIMIT", 60)
     log_level: str = os.environ.get("ANI_API_LOG_LEVEL", "INFO")

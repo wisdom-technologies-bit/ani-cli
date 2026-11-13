@@ -86,6 +86,78 @@ class DownloadInfo(BaseModel):
     reason: Optional[str] = None
 
 
+class MalPart(BaseModel):
+    """One verified HiAnime entry that serves a range of MAL episodes.
+
+    A MAL entry is normally one HiAnime slug; split cours are the exception, which
+    is why parts exist instead of a single id.
+    """
+    hianime_id: str
+    title: Optional[str] = None
+    episode_count: int = 0
+    mal_episode_start: Optional[int] = None
+    mal_episode_end: Optional[int] = None
+    verified_at: Optional[str] = None
+    evidence: Optional[str] = None
+
+
+class MalMapping(BaseModel):
+    mal_id: int
+    hianime_id: str
+    title: Optional[str] = None
+    title_english: Optional[str] = None
+    title_native: Optional[str] = None
+    titles: list[str] = Field(default_factory=list)
+    format: Optional[str] = None
+    season_year: Optional[int] = None
+    episode_count: int = 0
+    parts: list[MalPart] = Field(default_factory=list)
+    verified: bool = False
+    verified_by: Optional[str] = None      # e.g. "zokoanime_embed"
+    verified_at: Optional[str] = None
+    candidate_source: Optional[str] = None  # e.g. "anilist"
+    reused: bool = False                    # served from stored mapping / cache
+    note: Optional[str] = None
+
+
+class MalAnimeDetail(BaseModel):
+    mal_id: int
+    hianime_id: str
+    title: Optional[str] = None
+    title_english: Optional[str] = None
+    title_native: Optional[str] = None
+    titles: list[str] = Field(default_factory=list)
+    format: Optional[str] = None
+    season_year: Optional[int] = None
+    episode_count: int
+    parts: list[MalPart] = Field(default_factory=list)
+    mapping: MalMapping
+
+
+class MalEpisodeRef(BaseModel):
+    mal_id: int
+    hianime_id: str
+    episode_id: str
+    number: str                              # HiAnime episode number
+    mal_number: Optional[int] = None         # MAL episode number (part offset applied)
+    title: Optional[str] = None
+    title_source: Optional[str] = None
+    part: Optional[MalPart] = None
+    episode_verified: bool = False            # provider embed proved this exact mapping
+
+
+class MalContext(BaseModel):
+    mal_id: int
+    mal_episode: int
+    hianime_id: str
+    episode_id: str
+    part: Optional[MalPart] = None
+    stream_verified: bool = False
+    verification: str = "unverified"
+    evidence: Optional[str] = None
+    note: Optional[str] = None
+
+
 class StreamResponse(BaseModel):
     request_id: str
     provider: str
@@ -110,3 +182,4 @@ class StreamResponse(BaseModel):
     playback_hint: Optional[str] = None
     cache: dict = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    mal: Optional[MalContext] = None
