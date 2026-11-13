@@ -10,6 +10,7 @@ from .api.routes import router
 from . import obs
 from .config import settings
 from .errors import AniError
+from .services.security import ApiKeyMiddleware, problem_body
 
 
 def create_app() -> FastAPI:
@@ -24,11 +25,13 @@ def create_app() -> FastAPI:
         response.headers["x-request-id"] = request.state.request_id
         return response
 
+    # Authentication is decided above the router so no route can opt out of it.
+    app.add_middleware(ApiKeyMiddleware)
+
     @app.exception_handler(AniError)
     async def problem_json(request: Request, exc: AniError):  # RFC 9457-ish
-        body = dict(exc.detail) if isinstance(exc.detail, dict) else {"detail": str(exc.detail)}
-        body.update({"status": exc.status_code, "instance": str(request.url.path),
-                     "request_id": getattr(request.state, "request_id", "")})
+        body = problem_body(exc, str(request.url.path),
+                            getattr(request.state, "request_id", ""))
         headers = {}
         if body.get("retry_after"):
             headers["Retry-After"] = str(body["retry_after"])
