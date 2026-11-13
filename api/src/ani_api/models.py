@@ -32,10 +32,31 @@ class ServerRef(BaseModel):
 
 
 class SubtitleTrack(BaseModel):
-    format: Literal["vtt"] = "vtt"
+    """One subtitle track, exactly as the provider offered it plus display metadata.
+
+    ``label`` and ``provider_lang`` are the provider's own values, kept verbatim.
+    ``language``/``language_name``/``title`` are derived from the label only (the
+    provider's ``lang`` field is a constant ``"en"`` on every track observed, so it
+    is preserved but never used as the track language). Track language is never
+    verified against the audio: no speech recognition or language detection runs.
+    """
     url: str
-    proxied_url: Optional[str] = None
+    id: str = ""
+    index: int = 0
+    label: Optional[str] = None
+    title: str = ""
+    language: str = "und"
+    language_name: str = "Unknown Language"
+    language_source: Literal["provider_label", "unknown"] = "unknown"
+    kind: Literal["full", "signs", "forced", "dubtitle"] = "full"
+    format: Literal["vtt", "srt", "ass", "unknown"] = "unknown"
+    format_source: Literal["url_extension", "sniffed", "unknown"] = "unknown"
+    format_served: Literal["vtt"] = "vtt"
+    converted: bool = False
+    playable: bool = False
     default: bool = False
+    provider_lang: Optional[str] = None
+    proxied_url: Optional[str] = None
     language_inferred: Optional[str] = None
     language_verified: bool = False
 
@@ -174,6 +195,8 @@ class StreamResponse(BaseModel):
     variants: list[Variant] = Field(default_factory=list)
     alternatives: list[Variant] = Field(default_factory=list)
     subtitles: list[SubtitleTrack] = Field(default_factory=list)
+    subtitle_count: int = 0
+    subtitle_default_id: Optional[str] = None
     audio_tracks: list[dict] = Field(default_factory=list)
     headers_required: dict = Field(default_factory=dict)
     validation: Validation

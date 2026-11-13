@@ -22,6 +22,7 @@ from ..models import (AnimeDetail, AnimeRef, EpisodeRef, MalAnimeDetail, MalEpis
                       ServerRef, StreamResponse)
 from ..services.mal import MalResolver
 from ..services.security import assert_allowed_host, enforce_rate_limit, require_access, sign_payload, verify_token
+from ..services.subtitles import SubtitleConversionError, sniff_format, to_vtt
 from ..services.streams import StreamService
 from .. import obs
 from ..workers.lifetime_prober import curve, read_rows
@@ -219,10 +220,29 @@ async def proxied_media(token: str, _: None = Depends(require_access)) -> PlainT
 
 @router.get("/v1/subtitles/{token}.vtt", response_class=PlainTextResponse)
 async def proxied_subtitles(token: str, _: None = Depends(require_access)) -> PlainTextResponse:
+    """Serve one signed subtitle track as WebVTT.
+
+    The source may already be WebVTT, or SubRip, or ASS/SSA; those are converted, so
+    the URL handed to a player is always WebVTT whatever the provider used. A track
+    that cannot be fetched or parsed fails on its own (502/415) and never affects the
+    stream response or the other tracks.
+    """
     payload = verify_token(token)
     assert_allowed_host(payload["u"], ALLOWED_HOSTS)
     r = await _proxy_http.client.get(payload["u"], headers={"Referer": payload["r"]})
     if r.status_code >= 400:
         raise AniError(502, "SUBTITLE_FETCH_FAILED", "Upstream subtitle refused",
                        stage="subtitles", detail=f"HTTP {r.status_code}")
-    return PlainTextResponse(r.text, media_type="text/vtt")
+    if not r.text.strip():
+        raise AniError(502, "SUBTITLE_EMPTY", "Upstream subtitle is empty",
+                       stage="subtitles", detail="zero-byte body")
+    try:
+        source_format, body = to_vtt(r.text)
+    except SubtitleConversionError as exc:
+        raise AniError(415, "SUBTITLE_FORMAT_UNSUPPORTED", "Subtitle format not playable",
+                       stage="subtitles",
+                       detail=f"{exc} (detected {sniff_format(r.text)})") from exc
+    return PlainTextResponse(
+        body, media_type="text/vtt",
+        headers={"X-Subtitle-Source-Format": source_format,
+                 "Cache-Control": "private, max-age=300"})
