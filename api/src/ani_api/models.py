@@ -102,9 +102,20 @@ class UrlLifetime(BaseModel):
     note: Optional[str] = None
 
 
+class DownloadSource(BaseModel):
+    """One download option offered upstream. Files are not mirrored by this API."""
+    provider: str
+    audio: str
+    quality: str
+    url: str
+
+
 class DownloadInfo(BaseModel):
     available: bool = False
     reason: Optional[str] = None
+    provider: Optional[str] = None          # e.g. "nekostream" (AniKoto's mapper)
+    sources: list[DownloadSource] = Field(default_factory=list)
+    note: Optional[str] = None
 
 
 class MalPart(BaseModel):
@@ -206,3 +217,17 @@ class StreamResponse(BaseModel):
     cache: dict = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     mal: Optional[MalContext] = None
+    intro: Optional[list[float]] = None   # AniKoto/MegaPlay skip markers
+    outro: Optional[list[float]] = None
+
+
+class DownloadResponse(BaseModel):
+    """`/v1/downloads/mal/{id}/episode/{n}`: the mapper's links, passed through."""
+    mal_id: int
+    episode_number: int
+    available: bool
+    provider: Optional[str] = None
+    reason: Optional[str] = None
+    sources: list[DownloadSource] = Field(default_factory=list)
+    note: Optional[str] = None
+    cache: dict = Field(default_factory=dict)

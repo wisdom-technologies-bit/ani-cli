@@ -19,18 +19,24 @@ from ..config import settings
 from ..errors import AniError, mal_episode_mismatch
 from ..http_client import LoopClient
 from ..models import (AnimeDetail, AnimeRef, EpisodeRef, MalAnimeDetail, MalEpisodeRef,
-                      ServerRef, StreamResponse)
+                      ServerRef, StreamResponse, DownloadResponse, DownloadSource)
 from ..services.mal import MalResolver
 from ..services.security import assert_allowed_host, enforce_rate_limit, require_access, sign_payload, verify_token
 from ..services.subtitles import SubtitleConversionError, sniff_format, to_vtt
 from ..services.streams import StreamService
+from ..services import anikoto_source
 from .. import obs
 from ..workers.lifetime_prober import curve, read_rows
 
 router = APIRouter()
 
 # Only hosts our adapters actually produce may be proxied (SSRF prevention).
-ALLOWED_HOSTS = {"dramahot.top", "drama1.cfd", "hianime.at"}
+ALLOWED_HOSTS = {
+    "dramahot.top", "drama1.cfd", "hianime.at",
+    # AniKoto / MegaPlay: playlists, media hosts and the subtitle CDNs
+    "nexabloom.top", "twilightharbor.space", "megaplay.buzz",
+    "mysubsplay.com", "emeralddrift.world",
+}
 
 _metadata = HianimeAdapter()
 _zoko = ZokoAnimeAdapter()
@@ -124,6 +130,11 @@ async def mal_stream(request: Request, mal_id: int = Path(ge=1, le=2_000_000_000
                      _: None = Depends(require_access)) -> StreamResponse:
     await enforce_rate_limit(request)
     candidates = await _mal.episodes_for_stream(mal_id, episode_number, refresh=refresh)
+    anikoto = await anikoto_source.try_resolve(
+        _service, mal_id, episode_number, audio, quality, rid(request),
+        title_hint=(candidates[0].part.title if candidates and candidates[0].part else None))
+    if anikoto is not None:
+        return anikoto
     tried: list[str] = []
     for candidate in candidates:
         try:
@@ -246,3 +257,20 @@ async def proxied_subtitles(token: str, _: None = Depends(require_access)) -> Pl
         body, media_type="text/vtt",
         headers={"X-Subtitle-Source-Format": source_format,
                  "Cache-Control": "private, max-age=300"})
+
+
+@router.get("/v1/downloads/mal/{mal_id}/episode/{episode_number}", response_model=DownloadResponse,
+            summary="Download links for a MAL episode, from the AniKoto mapper")
+async def mal_downloads(request: Request, mal_id: int = Path(ge=1, le=2_000_000_000),
+                        episode_number: int = Path(ge=0, le=100_000),
+                        _: None = Depends(require_access)) -> DownloadResponse:
+    await enforce_rate_limit(request)
+    result = await asyncio.to_thread(anikoto_source.downloads_for_mal, mal_id, episode_number, None)
+    if not result.get("slug"):
+        raise AniError(404, "ANIKOTO_NOT_MAPPED", "No AniKoto mapping for this MAL id")
+    sources = [DownloadSource(**row) for row in result.get("sources") or []]
+    return DownloadResponse(
+        mal_id=mal_id, episode_number=episode_number, available=bool(sources),
+        provider="nekostream" if sources else None, reason=result.get("reason"),
+        sources=sources,
+        note="external download hosts; this API does not mirror or proxy the files")
