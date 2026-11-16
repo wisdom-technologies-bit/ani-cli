@@ -111,3 +111,31 @@ def test_downloads_route_unmapped_and_auth(client, monkeypatch):
     assert r.status_code == 404 and r.json()["code"] == "ANIKOTO_NOT_MAPPED"
     r2 = client.get("/v1/downloads/mal/21/episode/1", headers={"x-api-key": "wrong"})
     assert r2.status_code == 401
+
+
+def test_pin_ok_accepts_expected_episode():
+    from ani_api.adapters import anikoto as site
+    assert site.pin_ok("30298", {"30298"}) is True
+
+
+def test_pin_ok_rejects_foreign_episode():
+    from ani_api.adapters import anikoto as site
+    assert site.pin_ok("30298", {"30299"}) is False
+
+
+def test_pin_ok_is_lenient_when_unknown():
+    from ani_api.adapters import anikoto as site
+    assert site.pin_ok("", {"30299"}) is True
+    assert site.pin_ok("30298", set()) is True
+
+
+def test_episode_id_reads_data_id(monkeypatch):
+    from ani_api.adapters import anikoto as site
+    page = '<div data-anime-id="1642"></div>'
+    listing = {"result": '<a href="#" data-id="30298" data-num="1" data-mal="21">1</a>'
+                        '<a href="#" data-id="30299" data-num="2" data-mal="21">2</a>'}
+    monkeypatch.setattr(site, "_fetch", lambda *a, **k: page)
+    monkeypatch.setattr(site, "_ajax", lambda *a, **k: listing)
+    site._EP_ID_CACHE.clear()
+    assert site.episode_id("unit-slug", "2") == "30299"
+    site._EP_ID_CACHE.clear()
