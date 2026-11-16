@@ -217,3 +217,121 @@ def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None 
         except (AnikotoError, MegaPlayError, json.JSONDecodeError) as exc:
             errors.append(f"{option['name']}: {exc}")
     raise AnikotoError("ANIKOTO_ALL_SERVERS_FAILED", "; ".join(errors)[:200])
+
+# --- dub duplicate guard -------------------------------------------------
+# MegaPlay keys getSources by file id only, so /sub and /dub in the embed URL
+# are cosmetic and both decrypt to one file. Verified live: one-piece-odmau and
+# solo-leveling-ilh08 serve the SAME file id for sub and dub. Where that happens
+# a dub request must fail loudly rather than hand back the sub audio.
+_EMBED_FID = re.compile(r"/stream/[^/]+/(\d+)/")
+
+
+def _embed_url(slug: str, episode: str, audio: str) -> str:
+    for entry in servers(slug, str(episode)):
+        if entry["audio"] == audio:
+            body = _ajax(f"{BASE}/ajax/server?get={entry['link_id']}",
+                         f"{BASE}/watch/{slug}/ep-{episode}")
+            return str((body.get("result") or {}).get("url") or "")
+    return ""
+
+
+def _embed_fid(slug: str, episode: str, audio: str) -> str:
+    match = _EMBED_FID.search(_embed_url(slug, episode, audio))
+    return match.group(1) if match else ""
+
+
+_stream_impl = stream
+
+
+def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None = None) -> AnikotoStream:
+    result = _stream_impl(slug, episode, audio, server_name)
+    if audio == "dub":
+        dub_id = _embed_fid(slug, episode, "dub") or _EMBED_FID.search(result.get("master_url", "") or "") and ""
+        sub_id = _embed_fid(slug, episode, "sub")
+        if dub_id and sub_id and dub_id == sub_id:
+            raise AnikotoError("ANIKOTO_DUB_DUPLICATE",
+                               f"dub shares file id {dub_id} with sub; refusing to serve sub audio as dub")
+    return result
+
+_ANIKOTO_DUB_WRAPPED = True
+
+# --- episode pinning ------------------------------------------------------
+# A servers token is only trustworthy if the episode id it carries is the
+# episode we asked for. The episode list exposes data-id per episode; the server
+# list echoes it back as data-ep-id. They must agree, otherwise the token came
+# from a different episode and the stream would be the wrong episode.
+_ANIME_ID_RE = re.compile(r'data-anime-id="(\d+)"')
+_EP_PAIR_RE = re.compile(r'<a\b[^>]*data-num="(\d+)"[^>]*data-id="(\d+)"', re.S)
+_EP_PAIR_RE_ALT = re.compile(r'<a\b[^>]*data-id="(\d+)"[^>]*data-num="(\d+)"', re.S)
+_SERVER_EP_ID_RE = re.compile(r'data-ep-id="(\d+)"')
+
+_EP_ID_CACHE: "dict[str, dict[str, str]]" = {}
+_SERVER_EP_CACHE: "dict[tuple[str, str], set[str]]" = {}
+
+
+def _data_id_map(slug: str) -> "dict[str, str]":
+    """episode number -> data-id, from the episode list. Cached per slug."""
+    if slug in _EP_ID_CACHE:
+        return _EP_ID_CACHE[slug]
+    out: "dict[str, str]" = {}
+    try:
+        page = _fetch(f"{BASE}/watch/{slug}/ep-1", f"{BASE}/", ajax=False)
+        found = _ANIME_ID_RE.search(page)
+        if found:
+            body = _ajax(f"{BASE}/ajax/episode/list/{found.group(1)}", f"{BASE}/watch/{slug}/ep-1")
+            html = str(body.get("result") or "")
+            for num, eid in _EP_PAIR_RE.findall(html):
+                out[num] = eid
+            if not out:
+                for eid, num in _EP_PAIR_RE_ALT.findall(html):
+                    out[num] = eid
+    except Exception:
+        out = {}
+    _EP_ID_CACHE[slug] = out
+    return out
+
+
+def episode_id(slug: str, episode: str) -> str:
+    """The provider's own id for one episode, '' when unknown."""
+    return _data_id_map(slug).get(str(episode), "")
+
+
+def _server_ep_ids(slug: str, episode: str) -> "set[str]":
+    key = (slug, str(episode))
+    if key in _SERVER_EP_CACHE:
+        return _SERVER_EP_CACHE[key]
+    out: "set[str]" = set()
+    row = next((e for e in episodes(slug) if str(e["number"]) == str(episode)), None)
+    if row is not None:
+        try:
+            body = _ajax(f"{BASE}/ajax/server/list?servers={row['token']}",
+                         f"{BASE}/watch/{slug}/ep-{episode}")
+            out = set(_SERVER_EP_ID_RE.findall(str(body.get("result") or "")))
+        except Exception:
+            out = set()
+    _SERVER_EP_CACHE[key] = out
+    return out
+
+
+def pin_ok(expected: str, served: "set[str]") -> bool:
+    """True unless the server list clearly belongs to another episode."""
+    if not expected or not served:
+        return True
+    return expected in served
+
+
+_servers_impl = servers
+
+
+def servers(slug: str, episode: str) -> list[AnikotoServer]:
+    """Servers for one episode, with the token pinned to that episode."""
+    expected = episode_id(slug, episode)
+    served = _server_ep_ids(slug, episode)
+    if not pin_ok(expected, served):
+        raise AnikotoError(
+            "ANIKOTO_EPISODE_MISMATCH",
+            f"episode {episode} token served ep ids {sorted(served)}, expected {expected}")
+    return _servers_impl(slug, episode)
+
+
+_EPISODE_PINNED = True
