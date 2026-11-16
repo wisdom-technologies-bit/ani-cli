@@ -217,3 +217,40 @@ def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None 
         except (AnikotoError, MegaPlayError, json.JSONDecodeError) as exc:
             errors.append(f"{option['name']}: {exc}")
     raise AnikotoError("ANIKOTO_ALL_SERVERS_FAILED", "; ".join(errors)[:200])
+
+# --- dub duplicate guard -------------------------------------------------
+# MegaPlay keys getSources by file id only, so /sub and /dub in the embed URL
+# are cosmetic and both decrypt to one file. Verified live: one-piece-odmau and
+# solo-leveling-ilh08 serve the SAME file id for sub and dub. Where that happens
+# a dub request must fail loudly rather than hand back the sub audio.
+_EMBED_FID = re.compile(r"/stream/[^/]+/(\d+)/")
+
+
+def _embed_url(slug: str, episode: str, audio: str) -> str:
+    for entry in servers(slug, str(episode)):
+        if entry["audio"] == audio:
+            body = _ajax(f"{BASE}/ajax/server?get={entry['link_id']}",
+                         f"{BASE}/watch/{slug}/ep-{episode}")
+            return str((body.get("result") or {}).get("url") or "")
+    return ""
+
+
+def _embed_fid(slug: str, episode: str, audio: str) -> str:
+    match = _EMBED_FID.search(_embed_url(slug, episode, audio))
+    return match.group(1) if match else ""
+
+
+_stream_impl = stream
+
+
+def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None = None) -> AnikotoStream:
+    result = _stream_impl(slug, episode, audio, server_name)
+    if audio == "dub":
+        dub_id = _embed_fid(slug, episode, "dub") or _EMBED_FID.search(result.get("master_url", "") or "") and ""
+        sub_id = _embed_fid(slug, episode, "sub")
+        if dub_id and sub_id and dub_id == sub_id:
+            raise AnikotoError("ANIKOTO_DUB_DUPLICATE",
+                               f"dub shares file id {dub_id} with sub; refusing to serve sub audio as dub")
+    return result
+
+_ANIKOTO_DUB_WRAPPED = True
