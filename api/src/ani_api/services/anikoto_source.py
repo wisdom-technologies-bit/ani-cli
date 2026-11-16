@@ -21,6 +21,24 @@ from ..models import (AudioInfo, DownloadInfo, DownloadSource, MalContext, Strea
                       SubtitleTrack, UrlLifetime, Validation, Variant)
 from .security import sign_payload
 
+_ANIME_HASHES: dict[str, str] = {}
+
+
+def _anime_hash(master: str) -> str:
+    """The 32-hex anime directory inside a MegaPlay master URL."""
+    found = re.search(r"/anime/([0-9a-f]{32})/", master or "")
+    return found.group(1) if found else ""
+
+
+def _anime_hash_ok(slug: str, value: str) -> bool:
+    """One slug must always resolve to one anime hash; a change means cross-anime leakage."""
+    known = _ANIME_HASHES.get(slug)
+    if known is None:
+        _ANIME_HASHES[slug] = value
+        return True
+    return known == value
+
+
 MAP_PATH = Path(__file__).resolve().parents[3] / "data" / "anikoto_map.json"
 MASTER_REFERER = "https://megaplay.buzz/"
 PLAYBACK_HINT = ("HLS via AniKoto/MegaPlay. Segments live on the MegaPlay CDN and need "
@@ -131,8 +149,9 @@ async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: s
         if not slug:
             return None
         resolved = await asyncio.to_thread(site.stream, slug, str(episode), audio)
+
         # MegaPlay keys getSources by file id alone, so a dub request can hand back
-        # the sub file. Refuse a duplicate and let the caller fall back.
+        # the sub file. Refuse a duplicate so the caller falls back.
         if audio == 'dub':
             try:
                 _sub = await asyncio.to_thread(site.stream, slug, str(episode), 'sub')
@@ -140,10 +159,12 @@ async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: s
                 return None
             if not resolved.get('master') or resolved.get('master') == _sub.get('master'):
                 return None
-        # Same guard for identity: one slug must always resolve to one anime hash.
-        _h = _anime_hash(resolved.get('master') or '')
-        if _h and _anime_hash_ok(slug, _h) is False:
+        # Identity guard: one slug, one anime hash.
+        _hash = _anime_hash(resolved.get('master') or '')
+        if _hash and not _anime_hash_ok(slug, _hash):
             return None
+            if not resolved.get('master') or resolved.get('master') == _sub.get('master'):
+                return None
         listing = await asyncio.to_thread(site.episodes, slug)
         matched = next((e for e in listing if e["number"] == str(episode)), None)
         if matched is None or matched["mal_id"] != mal_id:
