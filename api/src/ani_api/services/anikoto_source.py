@@ -131,6 +131,19 @@ async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: s
         if not slug:
             return None
         resolved = await asyncio.to_thread(site.stream, slug, str(episode), audio)
+        # MegaPlay keys getSources by file id alone, so a dub request can hand back
+        # the sub file. Refuse a duplicate and let the caller fall back.
+        if audio == 'dub':
+            try:
+                _sub = await asyncio.to_thread(site.stream, slug, str(episode), 'sub')
+            except Exception:
+                return None
+            if not resolved.get('master') or resolved.get('master') == _sub.get('master'):
+                return None
+        # Same guard for identity: one slug must always resolve to one anime hash.
+        _h = _anime_hash(resolved.get('master') or '')
+        if _h and _anime_hash_ok(slug, _h) is False:
+            return None
         listing = await asyncio.to_thread(site.episodes, slug)
         matched = next((e for e in listing if e["number"] == str(episode)), None)
         if matched is None or matched["mal_id"] != mal_id:
