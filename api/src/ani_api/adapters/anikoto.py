@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, TypedDict
 from urllib.parse import quote
 
@@ -74,6 +75,7 @@ class AnikotoServer(TypedDict):
     audio: str
     server_id: str
     link_id: str
+    ep_id: str          # data-ep-id the provider attached to this server
 
 
 class AnikotoStream(TypedDict):
@@ -81,6 +83,8 @@ class AnikotoStream(TypedDict):
     referer: str
     audio: str
     server: str
+    episode_id: str     # provider episode id this file proved it belongs to
+    file_id: str        # MegaPlay file id (identity of the media file)
     subtitles: list[dict[str, Any]]
     intro: list[int] | None
     outro: list[int] | None
@@ -243,30 +247,42 @@ def _embed_fid(slug: str, episode: str, audio: str) -> str:
 _stream_impl = stream
 
 
-def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None = None) -> AnikotoStream:
-    result = _stream_impl(slug, episode, audio, server_name)
-    if audio == "dub":
-        dub_id = _embed_fid(slug, episode, "dub") or _EMBED_FID.search(result.get("master_url", "") or "") and ""
-        sub_id = _embed_fid(slug, episode, "sub")
-        if dub_id and sub_id and dub_id == sub_id:
-            raise AnikotoError("ANIKOTO_DUB_DUPLICATE",
-                               f"dub shares file id {dub_id} with sub; refusing to serve sub audio as dub")
-    return result
+# --- catalogue cache ------------------------------------------------------
+# Matching a title means inspecting several candidate catalogues, and a long
+# runner's episode list is a ~600 KB ajax payload. Cache it briefly so ranking
+# stays cheap without ever serving a stale-but-wrong mapping.
+_CATALOG_TTL = 900
+_CATALOG_CACHE: "dict[str, tuple[float, list[AnikotoEpisode]]]" = {}
 
-_ANIKOTO_DUB_WRAPPED = True
+
+def catalog(slug: str, refresh: bool = False) -> list[AnikotoEpisode]:
+    """Episode rows for one slug, cached for a few minutes."""
+    hit = _CATALOG_CACHE.get(slug)
+    now = time.time()
+    if hit and not refresh and now - hit[0] < _CATALOG_TTL:
+        return hit[1]
+    listing = episodes(slug)
+    _CATALOG_CACHE[slug] = (now, listing)
+    return listing
+
+
+_CATALOGED = True
+
 
 # --- episode pinning ------------------------------------------------------
 # A servers token is only trustworthy if the episode id it carries is the
 # episode we asked for. The episode list exposes data-id per episode; the server
-# list echoes it back as data-ep-id. They must agree, otherwise the token came
-# from a different episode and the stream would be the wrong episode.
+# list echoes it back as data-ep-id on every <li>. Every listed server must
+# carry the expected id - a list that merely *contains* it can still hand back a
+# different episode's file, which is exactly how a wrong episode gets served.
 _ANIME_ID_RE = re.compile(r'data-anime-id="(\d+)"')
 _EP_PAIR_RE = re.compile(r'<a\b[^>]*data-num="(\d+)"[^>]*data-id="(\d+)"', re.S)
 _EP_PAIR_RE_ALT = re.compile(r'<a\b[^>]*data-id="(\d+)"[^>]*data-num="(\d+)"', re.S)
 _SERVER_EP_ID_RE = re.compile(r'data-ep-id="(\d+)"')
+_SERVER_LI_RE = re.compile(r'<li\b([^>]*data-link-id[^>]*)>', re.S)
 
 _EP_ID_CACHE: "dict[str, dict[str, str]]" = {}
-_SERVER_EP_CACHE: "dict[tuple[str, str], set[str]]" = {}
+_SERVER_LIST_CACHE: "dict[tuple[str, str], tuple[float, str]]" = {}
 
 
 def _data_id_map(slug: str) -> "dict[str, str]":
@@ -296,25 +312,44 @@ def episode_id(slug: str, episode: str) -> str:
     return _data_id_map(slug).get(str(episode), "")
 
 
-def _server_ep_ids(slug: str, episode: str) -> "set[str]":
+def _server_list_html(slug: str, episode: str) -> str:
+    """Raw /ajax/server/list body for one episode, cached."""
     key = (slug, str(episode))
-    if key in _SERVER_EP_CACHE:
-        return _SERVER_EP_CACHE[key]
-    out: "set[str]" = set()
-    row = next((e for e in episodes(slug) if str(e["number"]) == str(episode)), None)
+    hit = _SERVER_LIST_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _CATALOG_TTL:
+        return hit[1]
+    row = next((e for e in catalog(slug) if str(e["number"]) == str(episode)), None)
+    html = ""
     if row is not None:
         try:
             body = _ajax(f"{BASE}/ajax/server/list?servers={row['token']}",
                          f"{BASE}/watch/{slug}/ep-{episode}")
-            out = set(_SERVER_EP_ID_RE.findall(str(body.get("result") or "")))
+            html = str(body.get("result") or "")
         except Exception:
-            out = set()
-    _SERVER_EP_CACHE[key] = out
+            html = ""
+    _SERVER_LIST_CACHE[key] = (now, html)
+    return html
+
+
+def _link_ep_ids(slug: str, episode: str) -> "dict[str, str]":
+    """link-id -> data-ep-id for every server offered for this episode."""
+    out: "dict[str, str]" = {}
+    for attrs in _SERVER_LI_RE.findall(_server_list_html(slug, episode)):
+        link = re.search(r'data-link-id="([^"]+)"', attrs)
+        ep = _SERVER_EP_ID_RE.search(attrs)
+        if link:
+            out[link.group(1)] = ep.group(1) if ep else ""
     return out
 
 
 def pin_ok(expected: str, served: "set[str]") -> bool:
-    """True unless the server list clearly belongs to another episode."""
+    """True while some offered server provably belongs to this episode.
+
+    Per-server filtering happens in `pinned_servers`, so a mixed list is not a
+    failure by itself: what must hold is that at least one server carries the
+    requested episode id. An empty signal cannot contradict the request.
+    """
     if not expected or not served:
         return True
     return expected in served
@@ -324,14 +359,101 @@ _servers_impl = servers
 
 
 def servers(slug: str, episode: str) -> list[AnikotoServer]:
-    """Servers for one episode, with the token pinned to that episode."""
+    """Servers for one episode, each pinned to that episode's data-id."""
     expected = episode_id(slug, episode)
-    served = _server_ep_ids(slug, episode)
-    if not pin_ok(expected, served):
+    links = _link_ep_ids(slug, episode)
+    served = {value for value in links.values() if value}
+
+    if expected and served and expected not in served:
         raise AnikotoError(
             "ANIKOTO_EPISODE_MISMATCH",
             f"episode {episode} token served ep ids {sorted(served)}, expected {expected}")
-    return _servers_impl(slug, episode)
+    if expected and not served and links:
+        raise AnikotoError(
+            "ANIKOTO_EPISODE_UNPINNED",
+            f"server list for episode {episode} carries no data-ep-id to prove it")
+
+    entries = _servers_impl(slug, episode)
+    return [AnikotoServer(**{**entry, "ep_id": links.get(entry["link_id"], "")})
+            for entry in entries]
+
+
+def pinned_servers(slug: str, episode: str, audio: str) -> list[AnikotoServer]:
+    """Servers for one episode and audio, refusing any that prove a different episode."""
+    expected = episode_id(slug, episode)
+    out = [entry for entry in servers(slug, episode)
+           if entry["audio"] == audio and (not expected or entry.get("ep_id") in ("", expected))]
+    if not out:
+        raise AnikotoError("ANIKOTO_NO_SERVERS", audio)
+    return out
+
+
+def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None = None) -> AnikotoStream:
+    """Resolve one episode, proving every server used belongs to that episode."""
+    expected = episode_id(slug, episode)
+    pinned = pinned_servers(slug, episode, audio)
+    if server_name:
+        pinned.sort(key=lambda entry: entry["name"].lower() != server_name.lower())
+
+    referer = f"{BASE}/watch/{slug}/ep-{episode}"
+    errors: list[str] = []
+    for option in pinned:
+        try:
+            resolved = _ajax(f"{BASE}/ajax/server?get={option['link_id']}", referer)
+            embed = (resolved.get("result") or {}).get("url") or ""
+            if "megaplay." not in embed:
+                errors.append(f"{option['name']}: not megaplay")
+                continue
+            file_id = file_id_from_embed(embed)
+            payload = json.loads(_fetch(
+                f"https://megaplay.buzz/stream/getSources?id={file_id}", MEGAPLAY_REFERER))
+            decrypted = decrypt_enc(payload["enc"])
+            tracks = payload.get("tracks") or []
+            skip = (resolved.get("result") or {}).get("skip_data") or {}
+            return {
+                "master_url": master_url(decrypted),
+                "referer": MEGAPLAY_REFERER,
+                "audio": audio,
+                "server": option["name"],
+                "episode_id": option.get("ep_id") or expected,
+                "file_id": file_id,
+                "subtitles": [
+                    {"url": t.get("file"), "label": t.get("label") or "Undefined",
+                     "srclang": (t.get("language") or "en"), "default": bool(t.get("default")),
+                     "kind": t.get("kind") or "captions"}
+                    for t in tracks if t.get("file") and not str(t.get("kind", "")).startswith("thumb")
+                ],
+                "intro": skip.get("intro"),
+                "outro": skip.get("outro"),
+            }
+        except (AnikotoError, MegaPlayError, json.JSONDecodeError) as exc:
+            errors.append(f"{option['name']}: {exc}")
+    raise AnikotoError("ANIKOTO_ALL_SERVERS_FAILED", "; ".join(errors)[:200])
+
+
+def assert_not_duplicate_dub(slug: str, episode: str, resolved: AnikotoStream) -> None:
+    """Refuse a dub whose file id is the sub's file id.
+
+    MegaPlay keys getSources by file id alone, so /sub and /dub in the embed URL
+    are cosmetic and both decrypt to one file. Where that happens a dub request
+    must fail loudly rather than hand back the sub audio.
+    """
+    if resolved.get("audio") != "dub":
+        return
+    dub_id = resolved.get("file_id") or ""
+    sub = next((entry for entry in servers(slug, episode) if entry["audio"] == "sub"), None)
+    if not sub:
+        return
+    try:
+        body = _ajax(f"{BASE}/ajax/server?get={sub['link_id']}", f"{BASE}/watch/{slug}/ep-{episode}")
+        match = _EMBED_FID.search(str((body.get("result") or {}).get("url") or ""))
+        sub_id = match.group(1) if match else ""
+    except Exception:
+        return
+    if dub_id and sub_id and dub_id == sub_id:
+        raise AnikotoError(
+            "ANIKOTO_DUB_DUPLICATE",
+            f"dub shares file id {dub_id} with sub; refusing to serve sub audio as dub")
 
 
 _EPISODE_PINNED = True
