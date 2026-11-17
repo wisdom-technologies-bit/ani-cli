@@ -17,6 +17,7 @@ from typing import Any
 
 from ..adapters import anikoto as site
 from . import anikoto_match
+from . import content_identity
 from ..adapters import nekostream
 from ..models import (AudioInfo, DownloadInfo, DownloadSource, MalContext, StreamResponse,
                       SubtitleTrack, UrlLifetime, Validation, Variant)
@@ -38,6 +39,26 @@ def dub_enabled() -> bool:
     Audio language is still provider-declared, never verified by this service.
     """
     return os.environ.get("ANIKOTO_DUB_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def content_check_enabled() -> bool:
+    """Verify that a resolved file really is the requested anime (default on).
+
+    AniKoto's file ids are not always honest even when its catalogue ids are, so
+    a package that names a different anime is refused rather than streamed.
+    """
+    return os.environ.get("ANIKOTO_CONTENT_CHECK", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _forget(mal_id: int) -> None:
+    """Drop a mapping proven to serve the wrong anime."""
+    try:
+        data = json.loads(MAP_PATH.read_text())
+    except Exception:
+        return
+    if str(mal_id) in data:
+        data.pop(str(mal_id), None)
+        MAP_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def enabled() -> bool:
@@ -187,6 +208,15 @@ async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: s
         matched = next((e for e in listing if e["number"] == str(episode)), None)
         if matched is None or matched["mal_id"] != mal_id:
             return None          # never serve a stream we cannot tie to this MAL episode
+
+        # The catalogue can be right while the file is someone else's: ask the
+        # package itself, and refuse when it names a different anime.
+        if content_check_enabled():
+            verdict = await asyncio.to_thread(
+                content_identity.verify_stream, resolved, mal_id, aliases, site.subtitle_text)
+            if verdict == "foreign":
+                _forget(mal_id)
+                return None
 
         # The server that produced the file must carry this episode's own id.
         expected_ep = await asyncio.to_thread(site.episode_id, slug, str(episode))
