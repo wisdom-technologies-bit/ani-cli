@@ -16,28 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters import anikoto as site
+from . import anikoto_match
 from ..adapters import nekostream
 from ..models import (AudioInfo, DownloadInfo, DownloadSource, MalContext, StreamResponse,
                       SubtitleTrack, UrlLifetime, Validation, Variant)
 from .security import sign_payload
-
-_ANIME_HASHES: dict[str, str] = {}
-
-
-def _anime_hash(master: str) -> str:
-    """The 32-hex anime directory inside a MegaPlay master URL."""
-    found = re.search(r"/anime/([0-9a-f]{32})/", master or "")
-    return found.group(1) if found else ""
-
-
-def _anime_hash_ok(slug: str, value: str) -> bool:
-    """One slug must always resolve to one anime hash; a change means cross-anime leakage."""
-    known = _ANIME_HASHES.get(slug)
-    if known is None:
-        _ANIME_HASHES[slug] = value
-        return True
-    return known == value
-
 
 MAP_PATH = Path(__file__).resolve().parents[3] / "data" / "anikoto_map.json"
 MASTER_REFERER = "https://megaplay.buzz/"
@@ -79,14 +62,44 @@ def _remember(mal_id: int, slug: str) -> None:
     MAP_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
-def _slug_by_title(title: str, mal_id: int, episode: str) -> str | None:
-    """Title search, then prove the candidate with the episode's data-mal."""
-    for hit in site.search(title, limit=5):
+def proves(slug: str, mal_id: int, episode: str) -> bool:
+    """True when this slug's own episode list ties (episode) to this MAL id."""
+    try:
+        listing = site.catalog(slug)
+    except site.AnikotoError:
+        return False
+    row = next((e for e in listing if str(e["number"]) == str(episode)), None)
+    return row is not None and row["mal_id"] == mal_id
+
+
+def _search_hits(titles: list[str]) -> list[dict[str, str]]:
+    """Every AniKoto search hit for a set of aliases, deduplicated by slug."""
+    hits: dict[str, dict[str, str]] = {}
+    for query in anikoto_match.search_queries(titles, 14):
         try:
-            listing = site.episodes(hit["slug"])
+            found = site.search(query, limit=8)
         except site.AnikotoError:
             continue
-        if any(e["number"] == episode and e["mal_id"] == mal_id for e in listing):
+        for hit in found:
+            hits.setdefault(hit["slug"], hit)
+    return list(hits.values())
+
+
+def _slug_by_titles(titles: list[str], mal_id: int, episode: str) -> str | None:
+    """Rank search hits by title identity, then prove the pick with data-mal.
+
+    This is the Anivexa rule: a franchise's search results are full of movies,
+    recaps and other seasons, so candidates are ordered by how strongly their
+    title identifies the requested entry *before* any catalogue is trusted, and
+    a candidate is only accepted when an episode row proves the MAL id.
+    """
+    titles = [title for title in titles if title]
+    if not titles:
+        return None
+    for score, hit in anikoto_match.rank(titles, _search_hits(titles)):
+        if 0 < score < 0.28:
+            continue                      # title says this is a different entry
+        if proves(hit["slug"], mal_id, episode):
             return hit["slug"]
     return None
 
@@ -133,42 +146,53 @@ def _variants(master_text: str, master_url: str) -> list[dict[str, Any]]:
 
 
 async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: str,
-                      request_id: str, title_hint: str | None = None) -> StreamResponse | None:
-    """Return an AniKoto stream, or None to fall through to ZokoAnime."""
+                      request_id: str, title_hint: str | None = None,
+                      titles: list[str] | None = None) -> StreamResponse | None:
+    """Return an AniKoto stream, or None to fall through to ZokoAnime.
+
+    Nothing is served unless the provider's own data ties *this* episode number
+    to *this* MAL id in three independent places: the catalogue row's data-mal,
+    the server list's data-ep-id on the server actually used, and the resolved
+    file's episode id. A title search hit alone is never enough.
+    """
     if not enabled():
         return None
     if audio == "dub" and not dub_enabled():
         return None                      # unverified audio: let ZokoAnime answer, as today
     started = time.time()
     try:
+        aliases = [title for title in ([title_hint] + list(titles or [])) if title]
+
+        # A remembered slug is a cache, not a fact: re-prove it for this episode
+        # before trusting it, otherwise a stale or mis-seeded entry resolves a
+        # different anime forever.
         slug = _mapped(mal_id)
-        if slug is None and title_hint:
-            slug = await asyncio.to_thread(_slug_by_title, title_hint, mal_id, str(episode))
+        if slug and not await asyncio.to_thread(proves, slug, mal_id, str(episode)):
+            slug = None
+        if slug is None:
+            slug = await asyncio.to_thread(_slug_by_titles, aliases, mal_id, str(episode))
             if slug:
                 _remember(mal_id, slug)
         if not slug:
             return None
+
         resolved = await asyncio.to_thread(site.stream, slug, str(episode), audio)
 
         # MegaPlay keys getSources by file id alone, so a dub request can hand back
         # the sub file. Refuse a duplicate so the caller falls back.
-        if audio == 'dub':
-            try:
-                _sub = await asyncio.to_thread(site.stream, slug, str(episode), 'sub')
-            except Exception:
-                return None
-            if not resolved.get('master') or resolved.get('master') == _sub.get('master'):
-                return None
-        # Identity guard: one slug, one anime hash.
-        _hash = _anime_hash(resolved.get('master') or '')
-        if _hash and not _anime_hash_ok(slug, _hash):
-            return None
-            if not resolved.get('master') or resolved.get('master') == _sub.get('master'):
-                return None
-        listing = await asyncio.to_thread(site.episodes, slug)
+        if audio == "dub":
+            await asyncio.to_thread(site.assert_not_duplicate_dub, slug, str(episode), resolved)
+
+        listing = await asyncio.to_thread(site.catalog, slug)
         matched = next((e for e in listing if e["number"] == str(episode)), None)
         if matched is None or matched["mal_id"] != mal_id:
             return None          # never serve a stream we cannot tie to this MAL episode
+
+        # The server that produced the file must carry this episode's own id.
+        expected_ep = await asyncio.to_thread(site.episode_id, slug, str(episode))
+        served_ep = resolved.get("episode_id") or ""
+        if expected_ep and served_ep and expected_ep != served_ep:
+            return None
         master_text = await asyncio.to_thread(_fetch_text, resolved["master_url"])
         if not master_text.startswith("#EXTM3U"):
             return None
@@ -239,7 +263,9 @@ async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: s
         payload.mal = MalContext(
             mal_id=mal_id, mal_episode=episode, hianime_id=slug, episode_id=str(matched["number"]),
             stream_verified=True, verification="anikoto_data_mal",
-            evidence=f"anikoto episode data-mal={matched['mal_id']} data-num={matched['number']}",
+            evidence=("anikoto episode data-mal=%s data-num=%s data-ep-id=%s"
+                              % (matched["mal_id"], matched["number"],
+                                 served_ep or expected_ep or "n/a")),
             note="AniKoto lists this episode's MAL id and number directly")
         payload.cache["anikoto_ms"] = int((time.time() - started) * 1000)
         return payload
@@ -249,7 +275,11 @@ async def try_resolve(service, mal_id: int, episode: int, audio: str, quality: s
 
 def downloads_for_mal(mal_id: int, episode: int, title_hint: str | None = None) -> dict:
     """Download links for one MAL episode from the AniKoto mapper. Sync: run in a thread."""
-    slug = _mapped(mal_id) or (_slug_by_title(title_hint, mal_id, str(episode)) if title_hint else None)
+    slug = _mapped(mal_id)
+    if slug and not proves(slug, mal_id, str(episode)):
+        slug = None
+    if slug is None and title_hint:
+        slug = _slug_by_titles([title_hint], mal_id, str(episode))
     if not slug:
         return {"slug": None, "sources": [], "reason": "ANIKOTO_NOT_MAPPED"}
     try:

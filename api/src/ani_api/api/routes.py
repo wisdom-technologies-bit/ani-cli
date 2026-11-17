@@ -129,12 +129,24 @@ async def mal_stream(request: Request, mal_id: int = Path(ge=1, le=2_000_000_000
                      refresh: bool = Query(False),
                      _: None = Depends(require_access)) -> StreamResponse:
     await enforce_rate_limit(request)
-    candidates = await _mal.episodes_for_stream(mal_id, episode_number, refresh=refresh)
+    # AniKoto resolves from its own catalogue, so it must not depend on the
+    # hianime/zoko metadata hop: a hiccup there used to abort the whole request
+    # even though AniKoto could answer. Try AniKoto first, then fall back.
+    try:
+        mapping = await _mal.mapping(mal_id)
+    except Exception:
+        mapping = None
+    # AniKoto files a show under whichever alias it picked, so hand the matcher
+    # every known title (english/romaji/native/synonyms) instead of one hint.
+    aliases = [title for title in (getattr(mapping, "titles", None) or []) if title]
     anikoto = await anikoto_source.try_resolve(
         _service, mal_id, episode_number, audio, quality, rid(request),
-        title_hint=(candidates[0].part.title if candidates and candidates[0].part else None))
+        title_hint=(mapping.parts[0].title if mapping and mapping.parts else None),
+        titles=aliases)
     if anikoto is not None:
         return anikoto
+
+    candidates = await _mal.episodes_for_stream(mal_id, episode_number, refresh=refresh)
     tried: list[str] = []
     for candidate in candidates:
         try:
