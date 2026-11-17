@@ -161,6 +161,35 @@ def episodes(slug: str) -> list[AnikotoEpisode]:
     return found
 
 
+_EMBED_ID_CACHE: dict[str, str] = {}
+
+
+def embed_file_id(embed_url: str) -> str:
+    """The file id the embed page declares, not the one in its own URL.
+
+    AniKoto's embed path carries an id that MegaPlay has since re-pointed at a
+    different file: /stream/s-2/2142/sub declares data-id="36396", and asking
+    getSources for 2142 answers with another anime's package while 36396
+    answers with the episode that was actually requested. The page is the
+    authority, so it is read first and the URL id is only a fallback.
+    """
+    key = embed_url.split("?")[0]
+    cached = _EMBED_ID_CACHE.get(key)
+    if cached:
+        return cached
+    declared = ""
+    try:
+        html = _fetch(key, MEGAPLAY_REFERER, ajax=False)
+        match = re.search(r'data-id=["\'](\d+)["\']', html)
+        if match:
+            declared = match.group(1)
+    except Exception:
+        declared = ""
+    file_id = declared or file_id_from_embed(embed_url)
+    _EMBED_ID_CACHE[key] = file_id
+    return file_id
+
+
 def servers(slug: str, episode: str) -> list[AnikotoServer]:
     """Named servers for one episode, sub and dub."""
     match = next((e for e in episodes(slug) if e["number"] == str(episode)), None)
@@ -198,7 +227,7 @@ def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None 
             if "megaplay." not in embed:
                 errors.append(f"{option['name']}: not megaplay")
                 continue
-            file_id = file_id_from_embed(embed)
+            file_id = embed_file_id(embed)
             payload = json.loads(_fetch(
                 f"https://megaplay.buzz/stream/getSources?id={file_id}", MEGAPLAY_REFERER))
             decrypted = decrypt_enc(payload["enc"])
@@ -404,7 +433,7 @@ def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None 
             if "megaplay." not in embed:
                 errors.append(f"{option['name']}: not megaplay")
                 continue
-            file_id = file_id_from_embed(embed)
+            file_id = embed_file_id(embed)
             payload = json.loads(_fetch(
                 f"https://megaplay.buzz/stream/getSources?id={file_id}", MEGAPLAY_REFERER))
             decrypted = decrypt_enc(payload["enc"])
@@ -429,6 +458,11 @@ def stream(slug: str, episode: str, audio: str = "sub", server_name: str | None 
         except (AnikotoError, MegaPlayError, json.JSONDecodeError) as exc:
             errors.append(f"{option['name']}: {exc}")
     raise AnikotoError("ANIKOTO_ALL_SERVERS_FAILED", "; ".join(errors)[:200])
+
+
+def subtitle_text(url: str) -> str:
+    """Body of a caption track the package ships; these name the show it belongs to."""
+    return _fetch(url, MEGAPLAY_REFERER, ajax=False)
 
 
 def assert_not_duplicate_dub(slug: str, episode: str, resolved: AnikotoStream) -> None:

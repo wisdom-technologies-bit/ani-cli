@@ -4,13 +4,13 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from pathlib import Path as FsPath
 
 from fastapi import APIRouter, Depends, Path, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 
 from ..adapters.hianime import HianimeAdapter
 from ..adapters.playlist import parse_master
@@ -36,6 +36,17 @@ ALLOWED_HOSTS = {
     # AniKoto / MegaPlay: playlists, media hosts and the subtitle CDNs
     "nexabloom.top", "twilightharbor.space", "megaplay.buzz",
     "mysubsplay.com", "emeralddrift.world",
+    # MegaPlay rotates its media CDNs; these are the shard families seen serving
+    # segments. Segments must be proxied because the CDNs answer 403 unless the
+    # request carries MegaPlay's Referer, which a browser cannot send.
+    "eclipseharbor.space", "crystaldrift.world", "harbor.space", "drift.world",
+}
+
+# Matches the media shard names, so a new shard on a known family needs no code change.
+_MEDIA_TYPES = {
+    ".ts": "video/mp2t", ".m4s": "video/iso.segment", ".mp4": "video/mp4",
+    ".m4v": "video/mp4", ".m4a": "audio/mp4", ".aac": "audio/aac",
+    ".vtt": "text/vtt", ".key": "application/octet-stream",
 }
 
 _metadata = HianimeAdapter()
@@ -232,13 +243,55 @@ async def proxied_master(token: str, _: None = Depends(require_access)) -> Plain
 
 @router.get("/v1/stream/{token}/media.m3u8", response_class=PlainTextResponse)
 async def proxied_media(token: str, _: None = Depends(require_access)) -> PlainTextResponse:
+    """Variant playlist, its segments rewritten to this API.
+
+    MegaPlay's media CDNs only answer requests that carry MegaPlay's Referer, so a
+    browser playing from another origin is refused with 403 even when the episode is
+    correct. Every segment is signed back through /media.bin, which applies that
+    Referer server-side and keeps playback on one origin.
+    """
     payload = verify_token(token)
     assert_allowed_host(payload["u"], ALLOWED_HOSTS)
     r = await _proxy_http.client.get(payload["u"], headers={"Referer": payload["r"]})
     if r.status_code >= 400:
         raise AniError(502, "PLAYLIST_FETCH_FAILED", "Upstream playlist refused",
                        stage="playlist", detail=f"HTTP {r.status_code}")
-    return PlainTextResponse(r.text, media_type="application/vnd.apple.mpegurl")
+    out = []
+    for line in r.text.splitlines():
+        if line and not line.startswith("#"):
+            absolute = urljoin(payload["u"], line.strip())
+            signed = sign_payload({"u": absolute, "r": payload["r"], "k": "seg"})
+            out.append(f"/v1/stream/{signed}/media.bin")
+        else:
+            out.append(line)
+    return PlainTextResponse("\n".join(out), media_type="application/vnd.apple.mpegurl")
+
+
+@router.get("/v1/stream/{token}/media.bin")
+async def proxied_segment(token: str, request: Request, _: None = Depends(require_access)) -> Response:
+    """One media segment, fetched server-side so the CDN's Referer rule is satisfied.
+
+    Range requests are forwarded untouched, so seeking keeps working in the player.
+    """
+    payload = verify_token(token)
+    assert_allowed_host(payload["u"], ALLOWED_HOSTS)
+    headers = {"Referer": payload["r"]}
+    requested_range = request.headers.get("range")
+    if requested_range:
+        headers["Range"] = requested_range
+    r = await _proxy_http.client.get(payload["u"], headers=headers)
+    if r.status_code >= 400:
+        raise AniError(502, "MEDIA_FETCH_FAILED", "Upstream segment refused",
+                       stage="segment", detail=f"HTTP {r.status_code}")
+    path = urlsplit(payload["u"]).path.lower()
+    tail = path.rsplit("/", 1)[-1]
+    media_type = _MEDIA_TYPES.get("." + tail.rsplit(".", 1)[-1] if "." in tail else "",
+                                  "application/octet-stream")
+    out = {"Cache-Control": "public, max-age=60", "Accept-Ranges": "bytes"}
+    if r.headers.get("content-range"):
+        out["Content-Range"] = r.headers["content-range"]
+    return Response(content=r.content, status_code=r.status_code, headers=out,
+                    media_type=media_type)
 
 
 @router.get("/v1/subtitles/{token}.vtt", response_class=PlainTextResponse)
